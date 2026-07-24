@@ -227,3 +227,33 @@ into `npm test` the same way `evasion-attempts`/`prompt-injection-variants` were
 chained routes and `router.use()` guards are correct today but not regression-protected against
 a future refactor. This does not block using or publishing v1; it's a follow-up, not a
 blocker.
+
+## Final closure: regression-samples test wiring
+
+Closed the one remaining named caveat above. Added two tests to `test/regression.test.js`
+(`chained-route-no-auth.js` gap-A case, `router-use-guard-protected.js` gap-B case), scanning
+`test/fixtures/regression-samples/` once and filtering findings by `finding.file` per test
+(`scanRepo()` has no per-file include filter — confirmed by reading `src/scanners/index.js`
+directly before assuming one existed). `npm test` now runs **15/15 passing**, independently
+re-run and confirmed, not taken on faith from any prior agent's report. Also independently
+re-verified, directly, rather than trusting the punch-list/redux reports: `git log` shows all
+12 commits from this session in the expected order with a clean working tree; `package.json`
+has `name: "vibescan-scan"`, `license: "MIT"`; `node bin/vibescan.js scan
+test/fixtures/vulnerable-demo-app --fail-on critical` exits `1` as documented.
+
+**All 7 original punch-list items are now genuinely closed**, each independently re-verified
+by running the actual commands rather than trusting any single report:
+1. Package name collision — resolved (`vibescan-scan` on the registry, `vibescan` command via
+   `bin`).
+2. CI workflow example — rewritten against the real CLI, locally proven to produce exit code 1
+   on findings.
+3. `--fail-on`/exit-code contract — implemented and verified in both directions (findings /
+   no findings).
+4. License — MIT, `LICENSE` file present.
+5. Git-history ancestor-repo misattribution — runtime-guarded, skips with a surfaced warning
+   instead of misattributing.
+6. Evasion/prompt-injection fixtures wired into `npm test` — 13 tests, all passing.
+7. `missing-auth-middleware` chained-route and `router.use()` gaps — logic fixed **and** now
+   regression-tested (this entry).
+
+### Final ship verdict: **Ship now.** No remaining named caveats from this session's punch list.

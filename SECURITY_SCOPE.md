@@ -123,6 +123,13 @@ Documented here so the tool never silently implies more coverage than it has:
     position in the file now suppresses the missing-auth finding for every route after it —
     matching the real Express semantics of router-level middleware.
 
+  Both fixes are now regression-tested (`test/regression.test.js`, added the same day as a
+  same-day follow-up to the follow-up — a skeptical-buyer re-audit caught that these two
+  fixtures existed on disk but weren't wired into `npm test`, the exact gap this project had
+  already fixed for `evasion-attempts`/`prompt-injection-variants` a few commits earlier): a
+  future refactor of `checkMissingAuthMiddleware` that reopens either gap will now fail
+  `npm test`, not just wait to be caught by another manual audit.
+
   Remaining limitations in these two fixes, not yet covered:
   - The chained-route fix only covers the literal-sensitive-path shape
     (`.route('/admin/...')`) and only directly-adjacent `.method(...)` links off that same

@@ -70,6 +70,48 @@ for (const [folder, expectedCheckId] of EVASION_CASES) {
   });
 }
 
+// Regression samples for the two missing-auth-middleware (check 7) gaps found in the
+// follow-up ship-readiness audit (see SECURITY_SCOPE.md, check 7 limitations). Unlike
+// EVASION_CASES above, these aren't adversarial evasion tricks -- they're ordinary,
+// idiomatic Express code (chained `.route(path).method()`, and a `router.use(authMw)`
+// guard applied once for a whole file). The skeptical-buyer redux review flagged that the
+// fix for these two gaps was verified by hand once and never wired into `npm test`, the
+// exact failure mode this file exists to close for the evasion/prompt-injection fixtures --
+// these two cases apply that same lesson to itself.
+const REGRESSION_SAMPLES_ROOT = path.join(__dirname, 'fixtures', 'regression-samples');
+
+// scanRepo() has no per-file include filter (only opts.skip, which skips whole scanner
+// modules) -- so both fixtures are scanned together in one pass, and each test filters
+// the combined findings down to the one file it cares about by checking finding.file.
+let regressionSamplesFindings;
+
+test('regression-samples/chained-route-no-auth.js: router.route(path).get(handler) with no auth is still caught (gap A)', async () => {
+  regressionSamplesFindings = regressionSamplesFindings || (await scanRepo(REGRESSION_SAMPLES_ROOT));
+
+  const missingAuthFindings = regressionSamplesFindings.filter(
+    (finding) => finding.checkId === 'missing-auth-middleware' && finding.file.includes('chained-route-no-auth.js')
+  );
+  assert.ok(
+    missingAuthFindings.length >= 1,
+    'expected at least one missing-auth-middleware finding on chained-route-no-auth.js (the chained ' +
+      '.route(path).get(handler) form) -- the chained-route detection (ROUTE_CHAIN_RE) may have regressed'
+  );
+});
+
+test('regression-samples/router-use-guard-protected.js: routes guarded by a preceding router.use(authMw) are not flagged (gap B)', async () => {
+  regressionSamplesFindings = regressionSamplesFindings || (await scanRepo(REGRESSION_SAMPLES_ROOT));
+
+  const missingAuthFindings = regressionSamplesFindings.filter(
+    (finding) => finding.checkId === 'missing-auth-middleware' && finding.file.includes('router-use-guard-protected.js')
+  );
+  assert.equal(
+    missingAuthFindings.length,
+    0,
+    'expected zero missing-auth-middleware findings for routes guarded by a preceding router.use(requireAuth) -- ' +
+      `the router.use() guard detection (hasAuthGuardUseBefore) may have regressed. Found: ${JSON.stringify(missingAuthFindings)}`
+  );
+});
+
 test('prompt-injection-variants: buildUserMessage() neutralizes every reachable injected tag/instruction', async () => {
   const findings = await scanRepo(PROMPT_INJECTION_ROOT);
   assert.ok(Array.isArray(findings), 'scanRepo() must resolve to an array of raw findings');
