@@ -60,6 +60,32 @@ function groupBySeverity(findings) {
   return groups;
 }
 
+/**
+ * Render a Markdown "Warnings" section for anything a scanner module reported via its
+ * `warnings` array (e.g. a check that had to be skipped) — kept visually prominent (its
+ * own heading, right under the top-of-report disclaimer) rather than folded into a
+ * footnote, since a skipped check can mean "no issues found" is misleading, not reassuring.
+ *
+ * @param {string[]} warnings
+ * @returns {string} Markdown, or '' if there are no warnings.
+ */
+function renderWarningsMarkdown(warnings) {
+  if (!Array.isArray(warnings) || warnings.length === 0) return '';
+  const lines = [];
+  lines.push('## ⚠ Warnings');
+  lines.push('');
+  lines.push(
+    '_One or more checks did not run at full scope this scan. Read these before treating ' +
+    'the findings below (or their absence) as complete:_'
+  );
+  lines.push('');
+  for (const warning of warnings) {
+    lines.push(`- ${warning}`);
+  }
+  lines.push('');
+  return lines.join('\n');
+}
+
 function formatLocation(finding) {
   if (finding.line === null || finding.line === undefined) return finding.file;
   return `${finding.file}:${finding.line}`;
@@ -128,6 +154,11 @@ function renderMarkdown(triageOutput) {
     lines.push('');
   }
 
+  const warningsMarkdown = renderWarningsMarkdown(triageOutput && triageOutput.warnings);
+  if (warningsMarkdown) {
+    lines.push(warningsMarkdown);
+  }
+
   if (total === 0) {
     lines.push('No issues found among VibeScan\'s 10 static checks.');
     lines.push('');
@@ -174,8 +205,20 @@ function renderTerminalSummary(triageOutput) {
   const findings = (triageOutput && Array.isArray(triageOutput.findings)) ? triageOutput.findings : [];
   const summary = getSummary(triageOutput);
   const total = SEVERITY_ORDER.reduce((sum, level) => sum + summary[level], 0);
+  const warnings = (triageOutput && Array.isArray(triageOutput.warnings)) ? triageOutput.warnings : [];
 
   const lines = [];
+
+  // Printed first and unconditionally (even on the "no issues found" path below) — a
+  // skipped check can be exactly why nothing was found, so it must not read as an
+  // afterthought or get lost after a reassuring "no issues" line.
+  if (warnings.length > 0) {
+    lines.push('⚠ WARNINGS:');
+    for (const warning of warnings) {
+      lines.push(`  - ${warning}`);
+    }
+    lines.push('');
+  }
 
   if (total === 0) {
     lines.push('VibeScan: no issues found.');

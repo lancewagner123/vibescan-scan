@@ -145,17 +145,28 @@ Documented here so the tool never silently implies more coverage than it has:
   `workspaces`/`pnpm-workspace.yaml`/`lerna.json` root config and issuing a single
   workspace-aware audit call, so a large monorepo with many packages will be slower than
   necessary (a real inefficiency, not a coverage gap).
-- **Known, still-open scope bug (not part of the 10 checks):** `secret-git-history` and
-  `secret-env-committed`'s git-history sub-scan both run git commands with `cwd` set to
-  the scanned path. If that path is a subdirectory of a larger git repository rather than
-  a repo root itself, git silently resolves to the *ancestor* repository's `.git` and its
-  entire history — not an error, just a result the caller likely didn't intend ("scan
-  this folder" can end up reporting on unrelated sibling content via repo-root-relative
-  paths that don't even correspond to files under the scanned path). This was found
-  during the same red-team pass and is **not yet fixed** — treat any `secret-git-history`
-  or git-history-sourced `secret-env-committed` finding as suspect until you've confirmed
-  the scanned path is itself a git repository root (`git rev-parse --show-toplevel`
-  equals the path you passed to VibeScan).
+- **Ancestor-repo scope bug — now guarded, not open (not part of the 10 checks):**
+  `secret-git-history` and `secret-env-committed`'s git-history sub-scan both run git
+  commands with `cwd` set to the scanned path. If that path is a subdirectory of a larger
+  git repository rather than a repo root itself, git commands there resolve against the
+  *ancestor* repository's `.git` and its entire history — not an error, just a result the
+  caller likely didn't intend ("scan this folder" could end up reporting on unrelated
+  sibling content via repo-root-relative paths that don't even correspond to files under
+  the scanned path). This was found during the same red-team pass that found the checks
+  below. It is now guarded at runtime (`src/scanners/util.js`'s `guardGitHistoryScope`,
+  used by both `git-history.js` and `secrets.js`): before either git-history-dependent
+  scan runs, VibeScan compares `git rev-parse --show-toplevel` for the scanned path
+  against the scanned path itself. If they don't match, both scans are **skipped
+  entirely** for that run (no misattributed findings are produced) and a prominent
+  warning is added to the scan's `warnings` array — surfaced in both the Markdown report
+  (its own "⚠ Warnings" section, right under the top disclaimer) and the terminal summary
+  (printed first, before the issue counts), not just left in the JSON output. The warning
+  names the enclosing repository root git actually resolved and tells the user to either
+  scan the real repository root or run `git init` in the target folder if it's meant to be
+  standalone. Net effect: a `secret-git-history` or git-history-sourced
+  `secret-env-committed` finding appearing in a report can now be trusted to have come from
+  the scanned path's own history — if the scope guard had tripped instead, there would be
+  no such finding, only the warning.
 
 ## Why this file exists
 

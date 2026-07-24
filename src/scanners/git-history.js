@@ -8,7 +8,7 @@
 // been removed from HEAD.
 
 const path = require('path');
-const { makeId, redactSecret, tryGit, isGitRepo } = require('./util');
+const { makeId, redactSecret, tryGit, isGitRepo, guardGitHistoryScope } = require('./util');
 const {
   SINGLE_LINE_PATTERNS,
   MULTILINE_PATTERNS,
@@ -170,6 +170,15 @@ function scan(repoPath, opts = {}) {
 
   if (!isGitRepo(repoPath)) {
     warnings.push('git-history.js: target is not a git repository (or git is unavailable) — check 3 (secret-git-history) skipped.');
+    return { findings: [], warnings };
+  }
+
+  // Guard against the ancestor-repo misattribution bug: `isGitRepo` above only proves
+  // repoPath is *somewhere inside* a git work tree, not that it's the repo's own root.
+  // See guardGitHistoryScope's docstring in util.js for the full "why".
+  const scope = guardGitHistoryScope(repoPath, 'check 3: secret-git-history');
+  if (!scope.ok) {
+    warnings.push(scope.warning);
     return { findings: [], warnings };
   }
 

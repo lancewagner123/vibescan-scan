@@ -18,6 +18,7 @@ const {
   looksLikePlaceholder,
   tryGit,
   isGitRepo,
+  guardGitHistoryScope,
   findStringConcatChains,
 } = require('./util');
 
@@ -321,15 +322,25 @@ function scanEnvFilesWorkingTree(repoPath) {
  * history across any branch — this catches the case where a secret-bearing .env file
  * was committed once and later deleted, which still leaks the file (and often its
  * contents) via history.
+ *
+ * @returns {{ findings: object[], warnings: string[] }}
  */
 function scanEnvFilesGitHistory(repoPath, workingTreeFindings) {
-  if (!isGitRepo(repoPath)) return [];
+  if (!isGitRepo(repoPath)) return { findings: [], warnings: [] };
+
+  // Guard against the ancestor-repo misattribution bug: `isGitRepo` above only proves
+  // repoPath is *somewhere inside* a git work tree, not that it's the repo's own root.
+  // See guardGitHistoryScope's docstring in util.js for the full "why".
+  const scope = guardGitHistoryScope(repoPath, "secret-env-committed's git-history scan");
+  if (!scope.ok) {
+    return { findings: [], warnings: [scope.warning] };
+  }
 
   const alreadyFlagged = new Set(workingTreeFindings.map((f) => f.file));
   const out = tryGit(repoPath, [
     'log', '--all', '--diff-filter=A', '--name-only', '--pretty=format:',
   ]);
-  if (out === null) return [];
+  if (out === null) return { findings: [], warnings: [] };
 
   const findings = [];
   const seen = new Set();
@@ -352,7 +363,7 @@ function scanEnvFilesGitHistory(repoPath, workingTreeFindings) {
       rawMessage: `Env file "${repoRelPath}" was committed at some point in git history and later removed — its contents may still be recoverable from history.`,
     });
   }
-  return findings;
+  return { findings, warnings: [] };
 }
 
 // --- Check 1: hardcoded secrets across the working tree ------------------------------
@@ -396,7 +407,9 @@ function scan(repoPath, opts = {}) {
   try {
     const workingTreeEnvFindings = scanEnvFilesWorkingTree(repoPath);
     findings = findings.concat(workingTreeEnvFindings);
-    findings = findings.concat(scanEnvFilesGitHistory(repoPath, workingTreeEnvFindings));
+    const gitHistoryEnvResult = scanEnvFilesGitHistory(repoPath, workingTreeEnvFindings);
+    findings = findings.concat(gitHistoryEnvResult.findings);
+    warnings.push(...gitHistoryEnvResult.warnings);
   } catch (err) {
     warnings.push(`secrets.js: env-file scan failed: ${err.message}`);
   }

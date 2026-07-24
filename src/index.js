@@ -24,6 +24,11 @@ const { renderMarkdown, renderTerminalSummary } = require('./report/render');
 async function run(repoPath, opts = {}) {
   const raw = scanRepo(repoPath, opts);
   const triaged = await triage(raw, opts);
+  // scanRepo attaches non-indexed `warnings` to the raw findings array (see scanners/index.js);
+  // triage() only reads the indexed findings, so that never rides along automatically —
+  // carry it forward explicitly so render.js can surface it in both report formats instead
+  // of it only being reachable via raw.warnings in the JSON output.
+  triaged.warnings = raw.warnings || [];
   const markdown = renderMarkdown(triaged);
   const terminalSummary = renderTerminalSummary(triaged);
 
