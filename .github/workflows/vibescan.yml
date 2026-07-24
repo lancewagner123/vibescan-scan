@@ -1,0 +1,57 @@
+# EXAMPLE WORKFLOW -- documentation by example, not this repo's own CI.
+#
+# This file shows how a CONSUMER project (i.e. a project that installs and runs
+# VibeScan against ITS OWN codebase) would wire VibeScan into GitHub Actions. Copy it
+# into your project's own .github/workflows/ directory and adjust the paths/branches to
+# fit. It is not used to scan VibeScan's own source.
+name: VibeScan security check
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  vibescan:
+    name: Run VibeScan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          # Full history, not just the last commit -- VibeScan's secret-git-history
+          # check (check 3) walks past commits with `git log -p`, and a shallow clone
+          # would hide anything not on the single fetched commit.
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install project dependencies
+        run: npm ci
+
+      - name: Run VibeScan against this repo
+        env:
+          # Optional: enables the LLM-written, plain-English triage step. If this secret
+          # isn't set, VibeScan falls back to a deterministic, non-LLM triage report
+          # instead of failing the job.
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: npx vibescan@latest --repo . --out vibescan-report.json
+
+      - name: Print a human-readable summary to the job log
+        run: npx vibescan@latest --report vibescan-report.json --format text
+
+      - name: Upload the full report as a build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vibescan-report
+          path: vibescan-report.json
+          if-no-files-found: warn
+
+      # Optional: fail the build outright when critical/high findings are present,
+      # instead of only reporting them. Uncomment once you're ready to make VibeScan a
+      # hard gate rather than an informational check.
+      # - name: Fail the build on critical/high findings
+      #   run: npx vibescan@latest --repo . --fail-on high

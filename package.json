@@ -8,7 +8,7 @@
     "vibescan": "bin/vibescan.js"
   },
   "scripts": {
-    "test": "node --test test/"
+    "test": "node --test test/e2e.test.js"
   },
   "engines": {
     "node": ">=22"

@@ -1,3 +1,10 @@
 node_modules/
 .env
 *.log
+vibescan-report.md
+vibescan-report.json
+
+# The vulnerable-demo-app test fixture deliberately seeds a fake .env with fake secrets
+# (used by the secret-env-committed / secret-hardcoded-generic checks) -- it must be
+# tracked in this repo, not excluded by the blanket ".env" rule above.
+!test/fixtures/vulnerable-demo-app/.env
