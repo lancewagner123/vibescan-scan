@@ -16,6 +16,28 @@ const SEVERITY_LABELS = {
   low: 'Low',
 };
 
+// checkIds whose suggested fixes get an extra, stronger warning beyond the generic
+// "unreviewed, verify before applying" note every fix gets. Per docs/CHECK_CATALOG.md /
+// docs/FINDINGS_SCHEMA.md's category field: missing-auth-middleware and
+// supabase-rls-disabled are both category "authz"; sql-string-concatenation and
+// stripe-webhook-unverified are named explicitly because an incomplete fix in either can
+// *look* successful (still-injectable SQL hidden inside a quoted literal; a webhook
+// handler that now calls something but not the real signature check) while leaving the
+// vulnerability open, or can break legitimate access. This list is render-level and does
+// not depend on the model remembering or restating anything.
+const HIGH_RISK_FIX_CHECK_IDS = new Set([
+  'missing-auth-middleware',
+  'supabase-rls-disabled',
+  'sql-string-concatenation',
+  'stripe-webhook-unverified',
+]);
+
+const SCOPE_DISCLAIMER =
+  '_VibeScan checks for 10 specific, high-signal static-analysis patterns only — not a ' +
+  'full security audit, not dynamic testing, no compliance coverage. See SECURITY_SCOPE.md._';
+
+const TERMINAL_SCOPE_NOTE = '(VibeScan checks 10 known patterns only — not a full audit. See SECURITY_SCOPE.md.)';
+
 /**
  * @param {{summary?: object, findings?: object[]}} triageOutput
  * @returns {{critical:number, high:number, medium:number, low:number}}
@@ -57,6 +79,22 @@ function renderFindingSection(finding, index) {
   lines.push('');
   lines.push(`**Suggested fix:** ${finding.fix.description}`);
   if (finding.fix.diff) {
+    const isHighRisk = (finding.sourceCheckIds || []).some((id) => HIGH_RISK_FIX_CHECK_IDS.has(id));
+    lines.push('');
+    lines.push(
+      '**⚠ Suggested diff — unreviewed, verify before applying.** VibeScan never applies ' +
+      'this for you; a human must read it, confirm it actually fixes the issue in the ' +
+      'context of the real codebase, and apply it by hand.'
+    );
+    if (isHighRisk) {
+      lines.push('');
+      lines.push(
+        '**⚠ This fix touches authentication/access-control or injection-prevention ' +
+        'logic.** An incomplete or subtly wrong fix here can look successful while ' +
+        'leaving the vulnerability open, or can break legitimate access. A human who ' +
+        'understands this codebase must review and test this change before merging.'
+      );
+    }
     lines.push('');
     lines.push('```diff');
     lines.push(finding.fix.diff.replace(/\n+$/, ''));
@@ -80,6 +118,8 @@ function renderMarkdown(triageOutput) {
   const lines = [];
   lines.push('# VibeScan Security Report');
   lines.push('');
+  lines.push(SCOPE_DISCLAIMER);
+  lines.push('');
   if (triageOutput && triageOutput.degraded) {
     lines.push(
       '> _Generated using VibeScan\'s deterministic rule-based triage (no LLM was available). ' +
@@ -89,7 +129,13 @@ function renderMarkdown(triageOutput) {
   }
 
   if (total === 0) {
-    lines.push('No issues found.');
+    lines.push('No issues found among VibeScan\'s 10 static checks.');
+    lines.push('');
+    lines.push(
+      'This does not mean your app is secure — VibeScan only looks for a fixed, narrow ' +
+      'catalog of known mistakes (see docs/CHECK_CATALOG.md and SECURITY_SCOPE.md). It ' +
+      'does not run your app, does not test business logic, and makes no compliance claim.'
+    );
     return lines.join('\n') + '\n';
   }
 
@@ -133,6 +179,7 @@ function renderTerminalSummary(triageOutput) {
 
   if (total === 0) {
     lines.push('VibeScan: no issues found.');
+    lines.push(TERMINAL_SCOPE_NOTE);
     return lines.join('\n');
   }
 
@@ -165,6 +212,9 @@ function renderTerminalSummary(triageOutput) {
     lines.push('');
     lines.push('(deterministic rule-based triage -- no LLM was available)');
   }
+
+  lines.push('');
+  lines.push(TERMINAL_SCOPE_NOTE);
 
   return lines.join('\n');
 }
