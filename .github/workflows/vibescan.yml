@@ -4,6 +4,13 @@
 # VibeScan against ITS OWN codebase) would wire VibeScan into GitHub Actions. Copy it
 # into your project's own .github/workflows/ directory and adjust the paths/branches to
 # fit. It is not used to scan VibeScan's own source.
+#
+# Verified against the CLI as it actually exists (bin/vibescan.js):
+#   vibescan scan [path] [--fail-on <critical|high|medium|low>]
+# There is no --repo, --out, --report, or --format flag -- the CLI always writes
+# ./vibescan-report.md and ./vibescan-report.json (relative to the working directory)
+# and always prints a terminal summary; --fail-on is the only flag, and it controls the
+# process exit code rather than what gets written.
 name: VibeScan security check
 
 on:
@@ -29,29 +36,27 @@ jobs:
         with:
           node-version: 22
 
-      - name: Install project dependencies
-        run: npm ci
-
+      # Runs the scan and fails this step (exit 1) if any finding is critical or high
+      # severity -- vibescan's own exit code does the gating, no separate check needed.
+      # Drop "--fail-on high" (or narrow it to "--fail-on critical") to change what
+      # counts as a hard failure; omit --fail-on entirely for a report-only, always-green
+      # run.
       - name: Run VibeScan against this repo
         env:
           # Optional: enables the LLM-written, plain-English triage step. If this secret
           # isn't set, VibeScan falls back to a deterministic, non-LLM triage report
           # instead of failing the job.
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-        run: npx vibescan@latest --repo . --out vibescan-report.json
+        run: npx vibescan-scan@latest scan . --fail-on high
 
-      - name: Print a human-readable summary to the job log
-        run: npx vibescan@latest --report vibescan-report.json --format text
-
+      # Runs even if the scan step above failed the build, so the report is still
+      # available to download from a red run, not just a green one.
       - name: Upload the full report as a build artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: vibescan-report
-          path: vibescan-report.json
+          path: |
+            vibescan-report.md
+            vibescan-report.json
           if-no-files-found: warn
-
-      # Optional: fail the build outright when critical/high findings are present,
-      # instead of only reporting them. Uncomment once you're ready to make VibeScan a
-      # hard gate rather than an informational check.
-      # - name: Fail the build on critical/high findings
-      #   run: npx vibescan@latest --repo . --fail-on high
