@@ -332,6 +332,146 @@ below for what's still open at the next level of indirection.
   check is still applied to the raw call-expression text in this case (there's no resolved
   variable name to check it against), so a validation guard written to check the
   *helper's* return value rather than the outer call site is not recognized either.
+## Round 2 audit (2026-07-24, same day) — deeper evasion/false-positive pass on checks 11-15
+
+A second, deeper round of adversarial and false-positive testing against checks 11-15
+specifically (three independent testers: an evasion hunter building 16 new fixtures, a
+false-positive hunter building 11 realistic-code samples, and a realistic-library-code
+tester exercising actual Mongoose/Sequelize/Prisma/Express shapes) found **14 new
+false-negative gaps**, **2 new false-positive gaps** (both check 14), and **4 additional
+gaps against real ORM/library call shapes** the first round hadn't exercised. All 20 were
+fixed the same day; three additional confirmed false positives were judged not cleanly
+fixable and are documented below as accepted tradeoffs instead. Regression fixtures live
+under `test/fixtures/evasion-attempts/17-round2-new-evasions/`,
+`test/fixtures/evasion-attempts/18-realistic-library-gaps/`, and (for the false positives)
+`test/fixtures/false-positives/`, wired into `test/regression.test.js` and
+`test/false-positives.test.js` respectively.
+
+**Fixed (false negatives):**
+- Check 11: a bracket-notation property key written as a template literal
+  (`` user[`sessionId`] ``) — the quote-character class only recognized `'`/`"`.
+- Check 11: `Math.random()` reached via a static-class-method call (`TokenGen.generate()`)
+  — neither the callee regex (bare identifier only) nor `lookupFunctionReturnExpr`
+  (no class-method lookup shape) could see it. `lookupFunctionReturnExpr` (util.js) now
+  dispatches a dotted `ClassName.method` callee to a dedicated class-static-method lookup.
+- Check 11: `Math.random()` reached via an `async` arrow-function helper (`const gen =
+  async () => Math.random()...`) — the arrow regexes required params immediately after
+  `=`, with no allowance for `async` in between.
+- Check 11: `Math.random()` reached via a function with a TypeScript return-type
+  annotation (`function generateResetToken(): string { ... }`) — the function-declaration
+  regex required `)` immediately followed by `{`.
+- Check 11: `Math.random()` buried inside a multi-line hand-rolled UUID generator callback
+  (the classic Stack Overflow `generateUUID()` snippet) — `lookupFunctionReturnExpr`'s
+  return-expression extraction stopped at the first newline; it now tracks bracket/string
+  depth (`extractReturnExpression`, util.js) so a multi-line return expression is captured
+  in full.
+- Check 12: `crypto['createHash'](...)` computed-member call — the call regex was
+  dot-notation only.
+- Check 12: the hash algorithm resolved via a class static field (`HashConfig.ALGO`) —
+  `resolveConcatExpression` (util.js) only resolved bare identifiers; it now also resolves
+  a `ClassName.FIELD` member expression back to a `static FIELD = ...` class member.
+  Same fix, one shared helper (`extractReturnExpression`) also closed the multi-line
+  return-expression gap above, since both are used by `lookupFunctionReturnExpr`.
+- Check 13: `req['body']` bracket/computed access — `isReqBodyOrQueryExpr` was
+  dot-notation only.
+- Check 13: plain and renamed destructuring (`const { body } = req;` / `const { body:
+  userData } = req;`) — `resolveIdentifierChain` only recognized a bare-identifier
+  declaration LHS; a new `resolveDestructuredReqSource` helper handles both forms.
+- Check 13: Mongoose's `findByIdAndUpdate`/`findOneAndUpdate` (and siblings
+  `findByIdAndDelete`/`findOneAndDelete`/`findByIdAndRemove`/`updateOne`/`updateMany`/
+  `bulkCreate`) — the method-name alternation was exactly `create|update|save`.
+- Check 13: Prisma's `{ data: req.body }` call shape — the whole ORM's write API nests
+  the payload under a `data:` key one level down, a shape `argIsWholeReqBodyOrQuery`
+  couldn't see at all before.
+- Check 14: an arrow helper with a paren-wrapped implicit-return object literal (`() =>
+  ({ maxAge: 3600000 })`, the mandatory idiomatic form) — `resolveObjectLiteralVar` tested
+  `/^\{/` against text that actually starts with `(`; a new `stripWrappingParens` helper
+  fixes this.
+- Check 15: optional chaining + nullish coalescing (`req.query?.next ?? '/home'`) —
+  `REQ_SOURCE_PROP_RE` required an exact match with no `?.`/`??` allowance.
+- Check 15: a template-literal-wrapped redirect target (`` res.redirect(`${req.query.next}`) ``)
+  — no branch unwrapped a template literal; `normalizeRedirectTarget` now does.
+- Check 15: nested destructuring straight off `req` (`const { query: { next } } = req;`)
+  — the existing destructure regex required the RHS to be exactly `req.query`/etc.
+- Check 15: an awaited helper call passed inline (`res.redirect(await
+  getRedirectTarget(req))`) — the call-expression regex was anchored and the leading
+  `await ` text broke it.
+- Check 15: a redirect target wrapped in `new URL(req.query.next, base).toString()` — a
+  real, well-known "looks safe, isn't" bypass idiom (the WHATWG URL parser ignores `base`
+  entirely if the first argument is itself an absolute URL); a dedicated
+  `resolveNewUrlFromReqSource` now recognizes it, and the resulting finding's message
+  explicitly explains why the `new URL(...)` wrapping is not actually a validation guard.
+
+**Fixed (false positives):**
+- Check 14: `secure: process.env.NODE_ENV === 'production'` — a near-universal,
+  textbook-correct Express idiom — was flagged as "missing secure:true" since
+  `SECURE_TRUE_RE` only recognized the literal boolean. A new `SECURE_ENV_CONDITIONAL_RE`
+  recognizes this pattern as an equally satisfying signal.
+- Check 14: an inline call expression used directly as the options argument
+  (`res.cookie('sid', t, buildSecureCookieOptions())`, where the helper returns a fully
+  correct `{ httpOnly: true, secure: true }`) was flagged as having "no options object at
+  all" — the code matched neither the inline-object nor bare-identifier branches, left
+  `optionsText` at its initial `null`, and then treated *any* reason for `optionsText`
+  being null as proof of absence. Restructured to distinguish "no 3rd argument at all"
+  (a real finding) from "a 3rd argument is present but unresolvable" (bail, don't guess) —
+  and added a resolution path (`resolveInlineCallOptionsArg`) for the inline-call shape
+  itself, so a securely-configured inline call is now recognized as secure rather than
+  reported as absent.
+- Check 15: a redirect target validated via `new URL(target, origin)` + an `.origin`
+  comparison (a standard, robust guard) wasn't in `hasNearbyRedirectValidation`'s
+  recognized-pattern list at all; added.
+- Check 15: a redirect target validated via an allowlist array named `internalPaths`
+  (equally safe, just not prefixed `allow(list|ed)`/`whitelist`) went unrecognized because
+  the `ARRAY.includes(VAR)` guard pattern required that specific naming prefix; dropped —
+  any `ARRAY.includes(VAR)` shape now suppresses the finding regardless of the array's
+  name (safe to broaden since this only *suppresses* a finding, never creates one).
+- Check 14: `res.cookie('authorTheme', authorThemePreference)` (a blog author's UI theme
+  preference, cosmetic-only) was flagged purely because `auth` is a literal substring of
+  `author`. Fixed narrowly, not with a blanket word-boundary change (which would also
+  have broken legitimate `authenticate`/`authorize`/`authentication` names — there's no
+  real word-boundary between "auth" and those suffixes either, camelCase compounds being
+  one continuous run of letters): `COOKIE_AUTH_KEYWORD_SRC` now excludes "auth" only when
+  immediately followed by "or" + a segment-ending character (a capital letter, non-letter,
+  or end-of-string) — matching "author"/"authorTheme" but not "authorize"/"authority",
+  which still read as auth-related and are still recognized.
+- Check 11: `tokenizerSeed` (an NLP mock-data seed; "token" is just the start of
+  "tokenizer") was flagged purely on substring overlap. A regex-inline lookahead fix was
+  tried first and found to be actively wrong under the pattern's own `i` (case-insensitive)
+  flag — `(?![a-z])` under `i` also excludes uppercase letters, since `[a-z]` itself gets
+  case-folded, which would have incorrectly blocked legitimate names like
+  `resetTokenValue`. Fixed instead with a JS-side post-filter
+  (`hasTokenIshKeywordAtBoundary`) that re-checks the ORIGINAL (un-folded) captured text:
+  a keyword occurrence immediately followed by a lowercase letter is treated as embedded
+  in a longer word and rejected; one followed by end-of-name/a digit/underscore/uppercase
+  letter is treated as a real boundary and kept.
+
+**Not fixed — new accepted limitations, documented rather than forced:**
+- Check 11: `secretIngredient` (a recipe app's "secret ingredient"), `gameToken` (a
+  board-game piece color), and `animationToken` (a UI animation dedup key) all remain
+  false positives. Unlike `tokenizerSeed` above, these keywords sit at a genuine camelCase
+  SEGMENT boundary on both sides (`secret` + capital `I`; `game` + capital `T`, ending at
+  end-of-name) — syntactically indistinguishable from a real `sessionSecret`/`authToken`.
+  No regex or boundary heuristic can tell these apart from real security-token names
+  without semantic understanding of what the code does; the substring vocabulary is core
+  to this check's design (it exists specifically to catch `resetToken`/`csrfToken`-style
+  names that a `\b`-anchored exact-word match would miss).
+- Check 12: a rate-limiter cache-key hash flagged because the word "password" appeared
+  incidentally in an unrelated route-path literal (`/reset-password`) in the same
+  statement as an unrelated `createHash('md5')` call. A narrow, low-frequency collision,
+  not worth chasing with more context-window tightening.
+- Check 12: a file living under `routes/auth/` gets any `createHash('md5'|'sha1')` call in
+  it flagged via the `AUTH_FILE_PATH_RE` fallback, even when hashing something unrelated
+  to a password (here, a cache key). This is a deliberate recall-over-precision tradeoff
+  for files that live under an auth-ish path with no password-ish signal nearby — tightening
+  it would risk reopening the evasion it exists to catch (password hashing that never says
+  "password" anywhere near the call).
+- Check 13: `Message.create(req.body)` on a public contact-form route is flagged even
+  though the target model genuinely has no privileged fields (no `isAdmin`/`role`/
+  `balance`) for an attacker to smuggle in. This check has zero schema/model awareness by
+  design — a regex/text scanner without semantic access to the model definition cannot
+  know which fields exist, so it flags the call SHAPE unconditionally. Not fixable without
+  adding real schema inspection, which is out of scope for this tool's architecture.
+
 - **Ancestor-repo scope bug — now guarded, not open (not part of the 10 checks):**
   `secret-git-history` and `secret-env-committed`'s git-history sub-scan both run git
   commands with `cwd` set to the scanned path. If that path is a subdirectory of a larger
