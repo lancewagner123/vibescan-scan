@@ -10,7 +10,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { execFileSync } = require('child_process');
-const { makeId } = require('./util');
+const { makeId, walkFiles } = require('./util');
 
 const CHECK_ID = 'vulnerable-dependency';
 const NPM_SEVERITIES_TO_REPORT = new Set(['high', 'critical']);
@@ -102,25 +102,39 @@ const NPM_SHELL_OPT = { shell: process.platform === 'win32' };
 
 const LOCKFILE_NAMES = ['package-lock.json', 'npm-shrinkwrap.json'];
 
-function scanNpmAudit(repoPath, warnings) {
-  const packageJsonPath = path.join(repoPath, 'package.json');
-  if (!fs.existsSync(packageJsonPath)) return [];
+// Was: only ever checked path.join(repoPath, 'package.json') at the exact scanned root,
+// with no recursive/workspace-aware search. A monorepo/workspaces layout (Turborepo, npm/
+// yarn/pnpm workspaces, Nx, Lerna) with the vulnerable dependency pinned inside a nested
+// package (e.g. packages/api/package.json) rather than at the repo root was therefore
+// entirely unscanned, even with no package.json at the root at all. Fixed by walking the
+// whole tree (reusing walkFiles's existing node_modules/.git/etc exclusions) for every
+// package.json found, auditing each one from its own directory.
+function findNestedPackageJsonDirs(repoPath) {
+  return walkFiles(repoPath, { extensions: ['.json'] })
+    .filter((f) => path.basename(f) === 'package.json')
+    .map((f) => path.dirname(f));
+}
 
-  const hasLockfile = LOCKFILE_NAMES.some((name) => fs.existsSync(path.join(repoPath, name)));
+function scanNpmAuditForPackageDir(pkgDir, repoPath, warnings) {
+  const packageJsonPath = path.join(pkgDir, 'package.json');
+  const repoRelPackageJson = path.relative(repoPath, packageJsonPath).split(path.sep).join('/');
+  const attachFile = (findings) => findings.map((f) => ({ ...f, file: repoRelPackageJson }));
+
+  const hasLockfile = LOCKFILE_NAMES.some((name) => fs.existsSync(path.join(pkgDir, name)));
 
   if (hasLockfile) {
     // A lockfile already exists — `npm audit` is read-only against it, so it's safe to
-    // run directly in the target repo without touching anything.
-    const result = runCaptureJson(NPM_BIN, ['audit', '--json'], repoPath, 50 * 1024 * 1024, NPM_SHELL_OPT);
+    // run directly in the target directory without touching anything.
+    const result = runCaptureJson(NPM_BIN, ['audit', '--json'], pkgDir, 50 * 1024 * 1024, NPM_SHELL_OPT);
     if (!result.ok) {
       if (isCommandNotFound(result.err)) {
         warnings.push('dependencies.js: npm is not available on PATH — skipped npm audit (check 10 for JS deps).');
       } else {
-        warnings.push(`dependencies.js: npm audit failed to run: ${result.err ? result.err.message : 'unknown error'}`);
+        warnings.push(`dependencies.js: npm audit failed to run for ${repoRelPackageJson}: ${result.err ? result.err.message : 'unknown error'}`);
       }
       return [];
     }
-    return parseNpmAuditJson(result.raw, warnings);
+    return attachFile(parseNpmAuditJson(result.raw, warnings));
   }
 
   // No lockfile committed (common for a freshly-scaffolded/AI-generated project that
@@ -145,19 +159,19 @@ function scanNpmAudit(repoPath, warnings) {
       if (isCommandNotFound(installResult.err)) {
         warnings.push('dependencies.js: npm is not available on PATH — skipped npm audit (check 10 for JS deps).');
       } else {
-        warnings.push('dependencies.js: no package-lock.json in target repo, and generating a temporary one failed (likely no network access) — skipped npm audit (check 10 for JS deps).');
+        warnings.push(`dependencies.js: no lockfile for ${repoRelPackageJson}, and generating a temporary one failed (likely no network access) — skipped npm audit for this package.`);
       }
       return [];
     }
 
     const auditResult = runCaptureJson(NPM_BIN, ['audit', '--json'], tempDir, 50 * 1024 * 1024, NPM_SHELL_OPT);
     if (!auditResult.ok) {
-      warnings.push(`dependencies.js: npm audit failed to run against generated lockfile: ${auditResult.err ? auditResult.err.message : 'unknown error'}`);
+      warnings.push(`dependencies.js: npm audit failed to run against generated lockfile for ${repoRelPackageJson}: ${auditResult.err ? auditResult.err.message : 'unknown error'}`);
       return [];
     }
-    return parseNpmAuditJson(auditResult.raw, warnings);
+    return attachFile(parseNpmAuditJson(auditResult.raw, warnings));
   } catch (err) {
-    warnings.push(`dependencies.js: could not audit package.json without a committed lockfile: ${err.message}`);
+    warnings.push(`dependencies.js: could not audit ${repoRelPackageJson} without a committed lockfile: ${err.message}`);
     return [];
   } finally {
     if (tempDir) {
@@ -168,6 +182,19 @@ function scanNpmAudit(repoPath, warnings) {
       }
     }
   }
+}
+
+function scanNpmAudit(repoPath, warnings) {
+  const pkgDirs = new Set();
+  if (fs.existsSync(path.join(repoPath, 'package.json'))) pkgDirs.add(repoPath);
+  for (const dir of findNestedPackageJsonDirs(repoPath)) pkgDirs.add(dir);
+  if (pkgDirs.size === 0) return [];
+
+  let findings = [];
+  for (const pkgDir of pkgDirs) {
+    findings = findings.concat(scanNpmAuditForPackageDir(pkgDir, repoPath, warnings));
+  }
+  return findings;
 }
 
 // --- pip-audit --------------------------------------------------------------------------

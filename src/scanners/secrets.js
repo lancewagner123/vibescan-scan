@@ -18,6 +18,7 @@ const {
   looksLikePlaceholder,
   tryGit,
   isGitRepo,
+  findStringConcatChains,
 } = require('./util');
 
 const CHECK_HARDCODED = 'secret-hardcoded-generic';
@@ -83,6 +84,97 @@ function scanLineGenericEntropy(line) {
   return hits;
 }
 
+// Same key/secret/token/password-ish-name heuristic as GENERIC_ENTROPY_RE, but for
+// UNQUOTED `KEY=value` assignments (classic dotenv shape) instead of quoted `key: "value"`
+// object/JS literals. Anchored to the WHOLE line (only optional leading/trailing
+// whitespace allowed) so it can't accidentally match a JS statement like
+// `const password = someLongVariableName;` -- that line has a `const ` prefix before the
+// key (breaking the required contiguous `[\w.$]*` + keyword run) and/or a trailing `;`
+// that the value's character class deliberately excludes, so ordinary source statements
+// fall through untouched while real `KEY=value`-shaped lines (as found in .env-style
+// files, regardless of filename) still match.
+const GENERIC_ENTROPY_UNQUOTED_RE = /^[ \t]*[\w.$]*(?:key|secret|token|password|passwd|pwd)[\w]*\s*=\s*([^\s#'"`;(){}[\]]{16,})[ \t]*$/gi;
+
+function scanLineGenericEntropyUnquoted(line) {
+  const hits = [];
+  GENERIC_ENTROPY_UNQUOTED_RE.lastIndex = 0;
+  let m;
+  while ((m = GENERIC_ENTROPY_UNQUOTED_RE.exec(line)) !== null) {
+    const value = m[1];
+    if (looksLikePlaceholder(value)) continue;
+    if (shannonEntropy(value) < ENTROPY_THRESHOLD) continue;
+    hits.push({ value, matchedText: m[0] });
+  }
+  return hits;
+}
+
+// --- Evasion-resistance pass 1: string-literal concatenation joining -----------------
+//
+// Defeats "split a known-format secret across two or three string literals joined with
+// `+` on the same line" (e.g. `'AKIA' + 'Q3FAKE7EXAMPLE9Z'`), which slips past every
+// SINGLE_LINE_PATTERNS regex above because none of them ever appears contiguous on the
+// line as written. Joins each concatenation chain found on the line back into a single
+// value and re-tests every known-format regex against that joined value.
+function scanLineConcatChains(line) {
+  const hits = [];
+  for (const chain of findStringConcatChains(line)) {
+    if (chain.value.length < 6) continue; // too short to be any known secret format
+    for (const pattern of SINGLE_LINE_PATTERNS) {
+      const m = chain.value.match(pattern.regex);
+      if (m) {
+        hits.push({
+          name: pattern.name,
+          matchedText: chain.raw,
+          secretValue: chain.value,
+          describeText: `${pattern.describe(m[0])} (reassembled from concatenated string literals: ${chain.raw.slice(0, 80)})`,
+        });
+      }
+    }
+  }
+  return hits;
+}
+
+// --- Evasion-resistance pass 2: base64 decode-and-recheck ----------------------------
+//
+// Defeats "base64-encode the secret and decode it at runtime, under an innocuous variable
+// name" -- base64 encoding removes every recognizable prefix (sk_live_, AKIA, etc.) so
+// none of the known-format regexes match the encoded literal itself, and using a variable
+// name with no key/secret/token/password substring keeps GENERIC_ENTROPY_RE from even
+// looking at it. Any quoted literal that looks base64-shaped gets decoded and the decoded
+// text re-run through the known-format regexes; a round-trip re-encode check guards
+// against "decoding" an unrelated long alphanumeric literal (a hex hash, an id, etc.)
+// into meaningless bytes that coincidentally matched something.
+const BASE64_LITERAL_RE = /['"]([A-Za-z0-9+/]{20,}={0,2})['"]/g;
+
+function scanLineBase64Encoded(line) {
+  const hits = [];
+  BASE64_LITERAL_RE.lastIndex = 0;
+  let m;
+  while ((m = BASE64_LITERAL_RE.exec(line)) !== null) {
+    const encoded = m[1];
+    let decoded;
+    try {
+      decoded = Buffer.from(encoded, 'base64').toString('utf8');
+    } catch {
+      continue;
+    }
+    const reencoded = Buffer.from(decoded, 'utf8').toString('base64').replace(/=+$/, '');
+    if (reencoded !== encoded.replace(/=+$/, '')) continue; // not actually valid base64 round-trip
+    for (const pattern of SINGLE_LINE_PATTERNS) {
+      const dm = decoded.match(pattern.regex);
+      if (dm) {
+        hits.push({
+          name: pattern.name,
+          matchedText: m[0],
+          secretValue: dm[0],
+          describeText: `${pattern.describe(dm[0])} (base64-encoded in source, decoded at scan time)`,
+        });
+      }
+    }
+  }
+  return hits;
+}
+
 /**
  * Scan arbitrary text (a file's contents, or a git diff's added-line text) for every
  * known secret pattern. Returns raw hits — not yet Finding objects — so callers (this
@@ -116,6 +208,33 @@ function scanTextForSecrets(text) {
         matchedText: hit.matchedText,
         secretValue: hit.value,
         describe: 'high-entropy literal assigned to a key/secret/token/password-like name',
+      });
+    }
+    for (const hit of scanLineGenericEntropyUnquoted(line)) {
+      hits.push({
+        name: 'generic-high-entropy-unquoted',
+        line: i + 1,
+        matchedText: hit.matchedText,
+        secretValue: hit.value,
+        describe: 'high-entropy unquoted KEY=value assignment (dotenv-style) to a key/secret/token/password-like name',
+      });
+    }
+    for (const hit of scanLineConcatChains(line)) {
+      hits.push({
+        name: hit.name,
+        line: i + 1,
+        matchedText: hit.matchedText,
+        secretValue: hit.secretValue,
+        describe: hit.describeText,
+      });
+    }
+    for (const hit of scanLineBase64Encoded(line)) {
+      hits.push({
+        name: hit.name,
+        line: i + 1,
+        matchedText: hit.matchedText,
+        secretValue: hit.secretValue,
+        describe: hit.describeText,
       });
     }
   }
@@ -163,7 +282,14 @@ const SAFE_ENV_TEMPLATE_NAMES = new Set([
   '.env.dist',
 ]);
 
-const ENV_FILE_RE = /^\.env(\..+)?$/;
+// Was /^\.env(\..+)?$/ -- required a literal dot before any suffix, so a filename like
+// ".env-production" (hyphen instead of dot) or ".env_local" (underscore) slipped through
+// even though it's the same real dotenv file loaded the same way at runtime. Broadened to
+// accept '.', '-', or '_' as the separator before the suffix, while still anchoring on
+// the leading ".env" so unrelated filenames (e.g. a hypothetical ".environment") aren't
+// swept in: after ".env" the next character must be one of [.\-_] or end-of-string, not
+// just any word character.
+const ENV_FILE_RE = /^\.env([.\-_].*)?$/;
 
 function isFlaggableEnvFilename(basename) {
   return ENV_FILE_RE.test(basename) && !SAFE_ENV_TEMPLATE_NAMES.has(basename);

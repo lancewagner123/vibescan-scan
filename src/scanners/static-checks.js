@@ -21,6 +21,60 @@ function snippetAt(text, index, len = 160) {
   return text.slice(lineStart, lineEnd).trim().slice(0, len);
 }
 
+/**
+ * Given text and the index of an opening '{', walk forward tracking brace depth to find
+ * the matching '}', returning the full block (including both braces). Heuristic, not a
+ * real parser -- doesn't treat quoted/template-literal content as opaque the way
+ * extractBalancedCallArg does, but it's only ever called against `clean` (comments
+ * already blanked) on narrow, function-body-shaped text, where a stray brace inside a
+ * string is rare enough to accept as a v1 limitation. Returns null if unbalanced.
+ */
+function extractBalancedBraceBlock(text, openBraceIndex) {
+  let depth = 0;
+  for (let i = openBraceIndex; i < text.length; i++) {
+    const ch = text[i];
+    if (ch === '{') depth++;
+    else if (ch === '}') {
+      depth--;
+      if (depth === 0) return text.slice(openBraceIndex, i + 1);
+    }
+  }
+  return null;
+}
+
+/**
+ * Resolve a simple `identifier + identifier`/`identifier + 'literal'`/`'literal' + ...`
+ * chain (as found in `expr`) to a single string, one level of `const/let/var` lookup
+ * deep for any bare identifier operand. Returns null (rather than guessing) the moment it
+ * hits anything it can't confidently resolve -- a function call, a member expression it
+ * can't find a declaration for, etc. Used to defeat "route path built via concatenation"
+ * and similar literal-splitting evasions without needing a real parser.
+ */
+function resolveConcatExpression(clean, expr) {
+  const parts = expr.split('+').map((p) => p.trim());
+  let resolved = '';
+  for (const part of parts) {
+    const litMatch = part.match(/^['"`]((?:[^'"`\\\n]|\\.)*)['"`]$/);
+    if (litMatch) {
+      resolved += litMatch[1];
+      continue;
+    }
+    const identMatch = part.match(/^[A-Za-z_$][\w$]*$/);
+    if (identMatch) {
+      const escaped = part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const declRe = new RegExp(`(?:const|let|var)\\s+${escaped}\\s*=\\s*([^;\\n]+);`);
+      const dm = clean.match(declRe);
+      if (!dm) return null;
+      const subResolved = resolveConcatExpression(clean, dm[1]);
+      if (subResolved === null) return null;
+      resolved += subResolved;
+      continue;
+    }
+    return null; // not a plain literal or a resolvable identifier -- bail rather than guess
+  }
+  return resolved;
+}
+
 // Every check below matches against `clean` (comments blanked out via stripComments)
 // but reports line numbers/snippets against `original` (unmodified source), so what a
 // reader sees still looks like real code. stripComments() preserves the exact length
@@ -70,6 +124,61 @@ const SQL_BUILT_VAR_RE = new RegExp(
   'gi',
 );
 
+// Case C ("taint-lite"): the concatenation happens inside a helper function's `return`
+// statement, one call removed from the eventual .query/.execute/.raw call site, e.g.
+//   function buildLookupQuery(table, id) { return 'SELECT * FROM ' + table + ...; }
+//   const sql = buildLookupQuery('users', req.params.id);
+//   db.query(sql);
+// Neither the inline regexes above (concatenation isn't written inside the call) nor
+// SQL_BUILT_VAR_RE (the concatenation is a `return` statement, not a `const/let/var =`)
+// ever see this. Requires a SQL keyword in the returned literal, same as SQL_BUILT_VAR_RE,
+// so this doesn't fire on unrelated string-building helpers.
+const FUNCTION_DECL_RE = /function\s+([A-Za-z_$][\w$]*)\s*\([^)]*\)\s*\{/g;
+const SQL_RETURN_BUILT_RE = new RegExp(
+  `return\\s+` +
+    `(?:` +
+    `\`[^\`]*\\b${SQL_KEYWORDS}\\b[^\`]*\\$\\{[^\`]*\\}[^\`]*\`` +
+    `|` +
+    `(['"])(?:(?!\\1)[^\\n])*?\\b${SQL_KEYWORDS}\\b(?:(?!\\1)[^\\n])*?\\1\\s*\\+\\s*[\\w.$]+` +
+    `(?:\\s*\\+\\s*(?:['"][^'"\\n]*['"]|[\\w.$]+))*` +
+    `)`,
+  'i',
+);
+
+function findSqlBuildingFunctionNames(clean) {
+  const names = new Set();
+  FUNCTION_DECL_RE.lastIndex = 0;
+  let m;
+  while ((m = FUNCTION_DECL_RE.exec(clean)) !== null) {
+    const braceIndex = m.index + m[0].length - 1;
+    const body = extractBalancedBraceBlock(clean, braceIndex);
+    if (body && SQL_RETURN_BUILT_RE.test(body)) names.add(m[1]);
+  }
+  return names;
+}
+
+function findSqlTaintedCallSites(clean, original, fnNames) {
+  const hits = [];
+  for (const fnName of fnNames) {
+    const escaped = fnName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const assignRe = new RegExp(`(?:const|let|var)\\s+([A-Za-z_$][\\w$]*)\\s*=\\s*(?:await\\s+)?${escaped}\\s*\\(`, 'g');
+    let am;
+    while ((am = assignRe.exec(clean)) !== null) {
+      const varName = am[1];
+      const afterAssignment = clean.slice(assignRe.lastIndex);
+      const usageRe = new RegExp(`\\.(?:query|execute|raw)\\s*\\(\\s*${varName}\\b`);
+      if (usageRe.test(afterAssignment)) {
+        hits.push({
+          line: lineOfIndex(original, am.index),
+          snippet: snippetAt(original, am.index),
+          rawMessage: `SQL string built via concatenation/interpolation inside helper function "${fnName}()" is assigned to variable "${varName}" here and then passed to a .query/.execute/.raw call -- same SQL injection risk as inline concatenation, just one function call removed.`,
+        });
+      }
+    }
+  }
+  return hits;
+}
+
 function checkSqlStringConcatenation(clean, filePath, original) {
   const hits = [];
 
@@ -98,6 +207,11 @@ function checkSqlStringConcatenation(clean, filePath, original) {
         rawMessage: `SQL string built via concatenation/interpolation into variable "${varName}", which is then passed to a .query/.execute/.raw call instead of using a parameterized query.`,
       });
     }
+  }
+
+  const sqlBuildingFnNames = findSqlBuildingFunctionNames(clean);
+  if (sqlBuildingFnNames.size > 0) {
+    hits.push(...findSqlTaintedCallSites(clean, original, sqlBuildingFnNames));
   }
 
   return hits;
@@ -135,7 +249,24 @@ function extractBalancedCallArg(text, openParenIndex) {
   return null;
 }
 
-function argLooksInterpolated(arg) {
+// Looks up `function <name>(...) { ... }` in `clean` and returns the expression in its
+// first `return` statement, or null if the function/return can't be found. Regex-located,
+// not a real parser -- deliberately only one level (callers don't recurse through this a
+// second time), which is cheap and enough to catch the common "wrap the interpolation in
+// a same-file helper" evasion without the complexity of real dataflow analysis.
+function lookupFunctionReturnExpr(clean, calleeName) {
+  const escaped = calleeName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const declRe = new RegExp(`function\\s+${escaped}\\s*\\([^)]*\\)\\s*\\{`);
+  const m = declRe.exec(clean);
+  if (!m) return null;
+  const braceIndex = m.index + m[0].length - 1;
+  const body = extractBalancedBraceBlock(clean, braceIndex);
+  if (!body) return null;
+  const rm = body.match(/return\s+([^;]+);/);
+  return rm ? rm[1] : null;
+}
+
+function argLooksInterpolated(arg, clean) {
   const trimmed = arg.trim();
   if (trimmed === '') return false;
   // Template literal containing ${...}
@@ -145,6 +276,15 @@ function argLooksInterpolated(arg) {
   // Bare identifier / member expression with no quotes at all — the whole arg is a
   // variable, so whatever built its value happens elsewhere (can't rule out user input).
   if (/^[A-Za-z_$][\w.$[\]]*$/.test(trimmed)) return true;
+  // One level of inlining: if the argument is itself a same-file function call (e.g.
+  // `eval(buildExpression(req.body.code))`), look up that function's own return
+  // expression and test *that* instead of giving up just because the outer argument text
+  // contains parentheses.
+  const callMatch = trimmed.match(/^([A-Za-z_$][\w.$]*)\s*\(/);
+  if (callMatch && clean) {
+    const returnExpr = lookupFunctionReturnExpr(clean, callMatch[1]);
+    if (returnExpr && argLooksInterpolated(returnExpr, null)) return true; // null: don't recurse a 2nd level
+  }
   return false;
 }
 
@@ -169,7 +309,7 @@ function checkEvalOnInput(clean, filePath, original) {
     const openParenIndex = m.index + m[0].length - 1; // position of the '(' itself
     const extracted = extractBalancedCallArg(clean, openParenIndex);
     if (!extracted) continue; // unbalanced parens — bail rather than guess
-    if (argLooksInterpolated(extracted.arg)) {
+    if (argLooksInterpolated(extracted.arg, clean)) {
       hits.push({
         line: lineOfIndex(original, m.index),
         snippet: snippetAt(original, m.index),
@@ -186,11 +326,26 @@ function checkEvalOnInput(clean, filePath, original) {
 const CORS_WILDCARD_RE = /(?:origin\s*:\s*['"]\*['"]|Access-Control-Allow-Origin['"]?\s*[:,]\s*['"]\*['"])/gi;
 const CORS_CREDENTIALS_RE = /(?:credentials\s*:\s*true|Access-Control-Allow-Credentials['"]?\s*[:,]\s*['"]?true)/i;
 
+// Wildcard-via-variable: `origin: someVar` where `someVar`'s own assignment can resolve
+// to '*' (a literal default via `||`/`??`, a ternary branch, etc.) is the same dangerous
+// misconfiguration as a literal '*' next to `origin:` -- just one hop further away from
+// the call site, which is enough to dodge CORS_WILDCARD_RE's purely positional match.
+const CORS_ORIGIN_VAR_RE = /origin\s*:\s*([A-Za-z_$][\w.$]*)\s*[,}]/gi;
+
+function findVarAssignmentContainingWildcard(clean, varName) {
+  const escaped = varName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const re = new RegExp(`(?:const|let|var)\\s+${escaped}\\s*=\\s*([^;\\n]+)`, 'i');
+  const m = clean.match(re);
+  if (!m) return null;
+  return /['"]\*['"]/.test(m[1]) ? m : null;
+}
+
 function checkCorsWildcardWithCredentials(clean, filePath, original) {
   const hasCredentials = CORS_CREDENTIALS_RE.test(clean);
   if (!hasCredentials) return [];
-  CORS_WILDCARD_RE.lastIndex = 0;
   const hits = [];
+
+  CORS_WILDCARD_RE.lastIndex = 0;
   let m;
   while ((m = CORS_WILDCARD_RE.exec(clean)) !== null) {
     hits.push({
@@ -199,6 +354,20 @@ function checkCorsWildcardWithCredentials(clean, filePath, original) {
       rawMessage: "CORS origin set to '*' in a file that also sets credentials:true / Access-Control-Allow-Credentials:true — browsers reject this combination, but some proxies/older clients won't, and it signals a misconfigured CORS policy.",
     });
   }
+
+  CORS_ORIGIN_VAR_RE.lastIndex = 0;
+  while ((m = CORS_ORIGIN_VAR_RE.exec(clean)) !== null) {
+    const varName = m[1];
+    const assignMatch = findVarAssignmentContainingWildcard(clean, varName);
+    if (assignMatch) {
+      hits.push({
+        line: lineOfIndex(original, m.index),
+        snippet: snippetAt(original, m.index),
+        rawMessage: `CORS origin is set from variable "${varName}", whose own assignment can resolve to the wildcard '*' (${assignMatch[0].trim().slice(0, 120)}) — combined with credentials:true this is the same dangerous misconfiguration as a literal '*', just one variable hop away.`,
+      });
+    }
+  }
+
   return hits;
 }
 
@@ -217,8 +386,56 @@ const SENSITIVE_ROUTE_INLINE_RE = /\.(get|post|put|delete|patch|all)\s*\(\s*(['"
 const SENSITIVE_FILE_PATH_RE = /(^|\/)(admin|internal|_?debug)(s)?([./]|$)/i;
 const ANY_ROUTE_CALL_RE = /\.(get|post|put|delete|patch|all)\s*\(\s*(['"`])([^'"`]*)\2/gi;
 
-const AUTH_KEYWORD_RE = /\b(auth|session|token|jwt|passport|isAuthenticated|requireLogin|ensureAuth|verifyToken|apikey|api_key|authorize|authenticate)\b/i;
-const ROUTE_WINDOW_CHARS = 2000; // lookahead window used to find the handler body / middleware chain
+// Case C: the route path is built via string concatenation instead of a single literal,
+// e.g. `router.post(ADMIN_BASE + '/delete-user', ...)` with `const ADMIN_BASE = '/adm' +
+// 'in';` declared earlier -- SENSITIVE_ROUTE_INLINE_RE requires the call's first argument
+// to be one complete quoted literal, so a binary `+` expression is invisible to it even
+// though the resolved path is exactly as sensitive.
+const ROUTE_CALL_CONCAT_RE = /\.(get|post|put|delete|patch|all)\s*\(\s*((?:[A-Za-z_$][\w.$]*|['"`](?:[^'"`\\\n]|\\.)*['"`])(?:\s*\+\s*(?:[A-Za-z_$][\w.$]*|['"`](?:[^'"`\\\n]|\\.)*['"`]))+)/gi;
+const SENSITIVE_PATH_PREFIX_RE = /^\/(?:admin|internal|_debug|internal-api)(?:\/|$)/;
+
+// AUTH_KEYWORD_RE used to fire on ANY occurrence of one of these words within a wide
+// +/-100/2000-char window -- including a merely-decorative import (`require('./auth-
+// logger')`) that never actually enforces anything, or a log call that just mentions
+// "auth" in passing. Tightened to require the keyword actually look like enforcement:
+// either (a) it's one of the arguments passed into the SAME route-registration call
+// (`router.get(path, requireAuth, handler)` -- real Express middleware wiring), or (b) a
+// termination pattern (401/403 response, or return/throw) appears in the following
+// handler-body window, which is the only way a check for auth can actually stop a
+// request rather than just mention the word "auth" somewhere nearby.
+const AUTH_KEYWORD_RE = /\b(auth|session|token|jwt|passport|isAuthenticated|requireLogin|ensureAuth|verifyToken|apikey|api_key|authorize|authenticate)\w*/i;
+const AUTH_KEYWORD_AS_ARG_RE = new RegExp(`${AUTH_KEYWORD_RE.source}\\s*,`, 'i');
+const AUTH_ENFORCEMENT_RE = /res\.(?:status\(\s*4(?:01|03)|sendStatus\(\s*4(?:01|03))|\bthrow\b/;
+const ROUTE_WINDOW_CHARS = 2000; // fallback lookahead window if the call's parens can't be balanced
+
+// Extracts the FULL argument list of the route-registration call starting at `callIndex`
+// (path literal/expression, any middleware arguments, and the inline handler function
+// body all together) by locating the call's own opening '(' and walking to its balanced
+// closing ')' via extractBalancedCallArg (already used by the eval-on-input check above).
+// Using the complete call text (rather than just the regex match up to the path literal,
+// or a fixed-size forward slice) lets both enforcement checks below see real middleware
+// wiring that appears *after* the path argument, e.g. `router.get('/admin', requireAuth,
+// handler)`.
+function extractRouteCallText(clean, callIndex) {
+  const openParenIndex = clean.indexOf('(', callIndex);
+  if (openParenIndex === -1) return null;
+  const extracted = extractBalancedCallArg(clean, openParenIndex);
+  return extracted ? extracted.arg : null;
+}
+
+function routeCallHasEnforcedAuth(clean, callIndex) {
+  const callText = extractRouteCallText(clean, callIndex)
+    || clean.slice(callIndex, Math.min(clean.length, callIndex + ROUTE_WINDOW_CHARS));
+  // (a) an auth-ish identifier passed as one of the arguments in the call itself, e.g.
+  // router.get('/admin', requireAuth, (req, res) => {...}) -- real Express middleware
+  // wiring, not just the word "auth" appearing somewhere nearby (a decorative import, an
+  // unrelated log call, etc, which is exactly what used to slip past the old wide-window
+  // substring check).
+  if (AUTH_KEYWORD_AS_ARG_RE.test(callText)) return true;
+  // (b) the handler body actually terminates the request on failure (401/403/throw)
+  // somewhere within the call.
+  return AUTH_ENFORCEMENT_RE.test(callText);
+}
 
 function findMissingAuthHits(clean, original, routeRe) {
   const hits = [];
@@ -226,16 +443,28 @@ function findMissingAuthHits(clean, original, routeRe) {
   let m;
   while ((m = routeRe.exec(clean)) !== null) {
     const routePath = m[3];
-    const windowEnd = Math.min(clean.length, m.index + ROUTE_WINDOW_CHARS);
-    // Also look a little behind the match, in case auth middleware is declared as a
-    // preceding argument on the same call, e.g. router.get('/admin', requireAuth, fn).
-    const windowStart = Math.max(0, m.index - 100);
-    const window = clean.slice(windowStart, windowEnd);
-    if (AUTH_KEYWORD_RE.test(window)) continue;
+    if (routeCallHasEnforcedAuth(clean, m.index)) continue;
     hits.push({
       line: lineOfIndex(original, m.index),
       snippet: snippetAt(original, m.index),
-      rawMessage: `Route handler for admin/internal-looking path "${routePath}" has no auth/session/token check heuristically found nearby in the handler or middleware chain.`,
+      rawMessage: `Route handler for admin/internal-looking path "${routePath}" has no enforced auth/session/token check found in the same call's middleware chain or the handler body (no 401/403 response or throw/return-on-failure pattern nearby).`,
+    });
+  }
+  return hits;
+}
+
+function findMissingAuthHitsFromConcatPaths(clean, original) {
+  const hits = [];
+  ROUTE_CALL_CONCAT_RE.lastIndex = 0;
+  let m;
+  while ((m = ROUTE_CALL_CONCAT_RE.exec(clean)) !== null) {
+    const resolved = resolveConcatExpression(clean, m[2]);
+    if (!resolved || !SENSITIVE_PATH_PREFIX_RE.test(resolved)) continue;
+    if (routeCallHasEnforcedAuth(clean, m.index)) continue;
+    hits.push({
+      line: lineOfIndex(original, m.index),
+      snippet: snippetAt(original, m.index),
+      rawMessage: `Route handler for admin/internal-looking path "${resolved}" (built via string concatenation rather than a single literal, so it's easy to miss) has no enforced auth/session/token check found nearby.`,
     });
   }
   return hits;
@@ -250,7 +479,10 @@ function checkMissingAuthMiddleware(clean, filePath, original) {
     // different file (the parent app.use('/admin', ...) call).
     return findMissingAuthHits(clean, original, ANY_ROUTE_CALL_RE);
   }
-  return findMissingAuthHits(clean, original, SENSITIVE_ROUTE_INLINE_RE);
+  return [
+    ...findMissingAuthHits(clean, original, SENSITIVE_ROUTE_INLINE_RE),
+    ...findMissingAuthHitsFromConcatPaths(clean, original),
+  ];
 }
 
 // --- Check 8: supabase-rls-disabled ----------------------------------------------------
@@ -260,9 +492,24 @@ const RLS_DISABLED_PATTERNS = [
   /"?row_level_security"?\s*[:=]\s*false/i,
   /"?rowLevelSecurity"?\s*[:=]\s*false/i,
   /enable_row_level_security\s*=\s*false/i,
+  // Was exact-key-name only, missing a differently-nested/abbreviated toggle expressing
+  // the identical thing, e.g. `security: { rls: { enabled: false } }`. Matches an "rls" /
+  // "row_level_security"-ish leaf key at any nesting depth, opening an object whose body
+  // (before the next closing brace) contains `enabled: false`.
+  /\b(?:rls|row[_-]?level[_-]?security)\b\s*:\s*\{[^{}]*\benabled\b\s*[:=]\s*false/i,
 ];
 
 const SERVICE_ROLE_RE = /SUPABASE_SERVICE_ROLE_KEY|service_role/;
+
+// Was a plain substring search for the literal env-var name -- defeated by building the
+// name out of separate string parts at runtime (`['SUPABASE','SERVICE','ROLE','KEY'].join
+// ('_')`) so the literal text never appears contiguous. A `process.env[<expr>]` computed
+// member access (as opposed to the usual static `process.env.NAME`) is itself inherently
+// suspicious in code that already looks client-side: bundlers generally can't statically
+// inline a computed lookup, so whatever privileged env var name is being resolved here
+// only exists at runtime -- exactly the shape this evasion produces regardless of what
+// the resolved name turns out to be.
+const COMPUTED_ENV_ACCESS_RE = /process\.env\[\s*[A-Za-z_$][\w.$]*\s*\]/g;
 
 function looksLikeClientSideFile(filePath, clean) {
   const normalized = filePath.split(path.sep).join('/');
@@ -295,17 +542,73 @@ function checkSupabaseRlsDisabled(clean, filePath, original) {
     });
   }
 
+  if (looksLikeClientSideFile(filePath, clean)) {
+    COMPUTED_ENV_ACCESS_RE.lastIndex = 0;
+    let cm;
+    while ((cm = COMPUTED_ENV_ACCESS_RE.exec(clean)) !== null) {
+      hits.push({
+        line: lineOfIndex(original, cm.index),
+        snippet: snippetAt(original, cm.index),
+        rawMessage: `Client-side-looking code reads an environment variable via a computed/dynamic key (${cm[0]}) instead of a static process.env.NAME reference — bundlers generally can't statically inline a computed lookup, so the real (possibly privileged, e.g. service_role) env var name and value are only resolved at runtime and may still ship to the browser bundle undetected by a literal-name search.`,
+      });
+    }
+  }
+
   return hits;
 }
 
 // --- Check 9: stripe-webhook-unverified -------------------------------------------------
+
+// Was "does the text `constructEvent` appear anywhere in this file" -- true the moment
+// the call exists, regardless of whether a failed verification actually stops the
+// request. Evaded by calling constructEvent inside a try, then swallowing the thrown
+// error in the catch (just logging it) and falling through to trust the raw body anyway.
+// Fixed with two independent checks run once constructEvent is confirmed present:
+//   (a) the catch block immediately following the constructEvent call must itself
+//       terminate the request (return / throw / a 4xx response) -- otherwise a caught
+//       verification failure is silently ignored and execution continues.
+//   (b) even when the catch DOES terminate correctly, still flag a fallback pattern like
+//       `const payload = event || JSON.parse(req.body)` -- combining the verified result
+//       with a raw-body fallback reintroduces the exact risk verification exists to close.
+const CATCH_BLOCK_START_RE = /\}\s*catch\s*(?:\([^)]*\))?\s*\{/g;
+const CATCH_ENFORCEMENT_RE = /\b(?:return|throw)\b|res\.(?:status\(\s*4|sendStatus\(\s*4)/;
+const FALLBACK_TO_RAW_BODY_RE = /=\s*[\w.$]+\s*\|\|\s*(?:JSON\.parse\s*\(\s*)?(?:req|request)\.body/;
+const MAX_CATCH_SEARCH_DISTANCE = 500; // catch must belong to the SAME try, not some unrelated later one
+
+function extractCatchBlockAfter(clean, fromIndex) {
+  CATCH_BLOCK_START_RE.lastIndex = fromIndex;
+  const m = CATCH_BLOCK_START_RE.exec(clean);
+  if (!m || m.index - fromIndex > MAX_CATCH_SEARCH_DISTANCE) return null;
+  const openBraceIndex = m.index + m[0].length - 1;
+  return extractBalancedBraceBlock(clean, openBraceIndex);
+}
 
 function checkStripeWebhookUnverified(clean, filePath, original) {
   const normalized = filePath.split(path.sep).join('/');
   const mentionsStripe = /stripe/i.test(clean) || /stripe/i.test(normalized);
   const mentionsWebhook = /webhook/i.test(clean) || /webhook/i.test(normalized);
   if (!mentionsStripe || !mentionsWebhook) return [];
-  if (/constructEvent/.test(clean)) return []; // signature verification present — not a finding
+
+  const constructMatch = clean.match(/constructEvent/);
+  if (constructMatch) {
+    const catchBody = extractCatchBlockAfter(clean, constructMatch.index);
+    const catchEnforces = !!(catchBody && CATCH_ENFORCEMENT_RE.test(catchBody));
+    const fallbackMatch = clean.match(FALLBACK_TO_RAW_BODY_RE);
+    if (catchEnforces && !fallbackMatch) {
+      return []; // verification present, its failure path actually aborts, no raw-body fallback either
+    }
+    const anchor = fallbackMatch || clean.match(/webhook/i) || { index: constructMatch.index };
+    const reason = !catchEnforces
+      ? "its catch block does not reject/abort the request on verification failure (no return/throw/4xx response found) — the request may proceed unverified"
+      : "the verified event is still combined with a fallback to the raw, unverified request body (e.g. `event || JSON.parse(req.body)`), reintroducing the same risk verification was meant to close";
+    return [
+      {
+        line: lineOfIndex(original, anchor.index),
+        snippet: snippetAt(original, anchor.index),
+        rawMessage: `Stripe webhook handler calls stripe.webhooks.constructEvent(), but ${reason}.`,
+      },
+    ];
+  }
 
   const usesRawBodyAsEvent = /req\.body|request\.body/.test(clean);
   if (!usesRawBodyAsEvent) return [];

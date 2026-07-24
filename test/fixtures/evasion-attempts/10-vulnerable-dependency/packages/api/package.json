@@ -1,0 +1,10 @@
+{
+  "name": "@internal/api",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Evasion for check 10 (vulnerable-dependency): scanNpmAudit() only ever looks at path.join(repoPath, 'package.json') -- the package.json sitting directly at the SCANNED ROOT. It never walks subdirectories looking for nested/workspace package.json files. A monorepo/workspace layout where the vulnerable dependency is pinned inside a nested package (packages/api/package.json) rather than at the repo root is therefore completely invisible to check 10, even though `npm audit` run *from inside packages/api* would report it immediately. This directory deliberately has no package.json at its own root (test/fixtures/evasion-attempts/10-vulnerable-dependency/) to reproduce that exact blind spot.",
+  "dependencies": {
+    "lodash": "4.17.11",
+    "minimist": "0.0.8"
+  }
+}
