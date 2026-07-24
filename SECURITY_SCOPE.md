@@ -208,6 +208,27 @@ below for what's still open at the next level of indirection.
     (`router.use([a, b])`) is not recognized as a bare identifier and such routes will still
     (conservatively) be flagged. And as always, the identifier's name is still just a naming
     heuristic, not confirmation that the referenced function actually enforces anything.
+
+  A third gap, found in an independent false-positive sweep the same day (2026-07-24), was
+  **also fixed**: `AUTH_KEYWORD_AS_ARG_RE` (case (a) of `routeCallHasEnforcedAuth` — "is an
+  auth-ish identifier passed as one of the arguments in the route-registration call itself")
+  had kept `AUTH_KEYWORD_RE`'s leading `\b` word-boundary anchor. `\b` requires a
+  word/non-word transition, but a camelCase identifier like `requireAuth` or `checkAuth` has
+  no such transition immediately before "Auth" (`e`->`A`/`k`->`A` are both word-to-word), so
+  the single most idiomatic Express middleware-naming style was invisible to the inline-arg,
+  concat-path, and chained-route auth-argument checks — `router.get('/admin/x', requireAuth,
+  handler)` was reported as **missing** auth despite real middleware being passed inline. Only
+  vocabulary-*initial* names (`authMiddleware`, `isAuthenticated`) matched. The
+  `router.use(requireAuth)` guard case (immediately above) was already immune, because
+  `AUTH_MIDDLEWARE_NAME_RE` for that specific case had deliberately dropped the anchor — but
+  the fix was never mirrored onto the inline-argument/concat/chained-route shapes it
+  conceptually shares vocabulary with, an asymmetry `SECURITY_SCOPE.md` didn't disclose.
+  **Fixed** by extracting a single shared, unanchored `AUTH_KEYWORD_VOCAB` word list that both
+  `AUTH_KEYWORD_RE` (still `\b`-anchored, used only for its own doc comment now) and
+  `AUTH_KEYWORD_AS_ARG_RE` (unanchored, matching the precedent already set by
+  `AUTH_MIDDLEWARE_NAME_RE`) build from — rather than maintaining two divergent patterns for
+  the same "does this identifier look auth-ish" test. Regression-tested:
+  `test/fixtures/regression-samples/inline-camelcase-auth-arg.js`.
 - **Supabase RLS (check 8):** the nested-key RLS pattern only matches one level of `{
   ... }` nesting with `enabled: false` textually close to the `rls`/`row_level_security`
   key; a differently-shaped toggle (a string value like `"disabled"`, a boolean stored

@@ -327,8 +327,22 @@ const SENSITIVE_PATH_PREFIX_RE = /^\/(?:admin|internal|_debug|internal-api)(?:\/
 // termination pattern (401/403 response, or return/throw) appears in the following
 // handler-body window, which is the only way a check for auth can actually stop a
 // request rather than just mention the word "auth" somewhere nearby.
-const AUTH_KEYWORD_RE = /\b(auth|session|token|jwt|passport|isAuthenticated|requireLogin|ensureAuth|verifyToken|apikey|api_key|authorize|authenticate)\w*/i;
-const AUTH_KEYWORD_AS_ARG_RE = new RegExp(`${AUTH_KEYWORD_RE.source}\\s*,`, 'i');
+//
+// AUTH_KEYWORD_VOCAB is the single shared word list for "does this identifier look
+// auth-ish" -- deliberately unanchored (no leading `\b` on "auth" itself) because the
+// single most idiomatic Express middleware-naming style is camelCase with the keyword
+// starting mid-identifier (`requireAuth`, `checkAuth`, `ensureLoggedIn`-style), where
+// there is no word-boundary transition immediately before "Auth" (`e`->`A`/`k`->`A` are
+// both word-to-word). A leading `\b` here previously made AUTH_KEYWORD_AS_ARG_RE invisible
+// to exactly that naming style while still matching vocabulary-initial names like
+// `authMiddleware`/`isAuthenticated` -- an asymmetry that didn't exist for the
+// router.use(requireAuth) guard case below (AUTH_MIDDLEWARE_NAME_RE), which already
+// deliberately dropped the anchor for the same reason. Both call sites now share this one
+// vocabulary instead of maintaining two divergent patterns for the same "auth-ish
+// identifier" test.
+const AUTH_KEYWORD_VOCAB = '(auth|session|token|jwt|passport|isAuthenticated|requireLogin|ensureAuth|verifyToken|apikey|api_key|authorize|authenticate)\\w*';
+const AUTH_KEYWORD_RE = new RegExp(`\\b${AUTH_KEYWORD_VOCAB}`, 'i');
+const AUTH_KEYWORD_AS_ARG_RE = new RegExp(`${AUTH_KEYWORD_VOCAB}\\s*,`, 'i');
 const AUTH_ENFORCEMENT_RE = /res\.(?:status\(\s*4(?:01|03)|sendStatus\(\s*4(?:01|03))|\bthrow\b/;
 const ROUTE_WINDOW_CHARS = 2000; // fallback lookahead window if the call's parens can't be balanced
 
@@ -615,7 +629,12 @@ function checkStripeWebhookUnverified(clean, filePath, original) {
     if (catchEnforces && !fallbackMatch) {
       return []; // verification present, its failure path actually aborts, no raw-body fallback either
     }
-    const anchor = fallbackMatch || clean.match(/webhook/i) || { index: constructMatch.index };
+    // Anchor to the fallback pattern when that's the reason for the finding, otherwise to
+    // the constructEvent() call itself -- a generic /webhook/i word search (the previous
+    // fallback here) can land on an unrelated occurrence of the substring "webhook"
+    // elsewhere in the file (see the analogous fix a few lines down for the no-constructEvent
+    // branch, which is where this exact imprecision was first caught).
+    const anchor = fallbackMatch || { index: constructMatch.index };
     const reason = !catchEnforces
       ? "its catch block does not reject/abort the request on verification failure (no return/throw/4xx response found) — the request may proceed unverified"
       : "the verified event is still combined with a fallback to the raw, unverified request body (e.g. `event || JSON.parse(req.body)`), reintroducing the same risk verification was meant to close";
@@ -628,10 +647,15 @@ function checkStripeWebhookUnverified(clean, filePath, original) {
     ];
   }
 
-  const usesRawBodyAsEvent = /req\.body|request\.body/.test(clean);
-  if (!usesRawBodyAsEvent) return [];
+  // Anchor to the actual req.body/request.body match that made this a finding, not a
+  // generic `webhook` word search -- the file's first "webhook" substring can land
+  // anywhere (a route path, an import, an unrelated SQL table name like
+  // `webhook_events` on a completely different line/statement) and previously produced
+  // a finding that pointed at code with no real connection to the unverified-body read.
+  const rawBodyMatch = clean.match(/req\.body|request\.body/);
+  if (!rawBodyMatch) return [];
 
-  const anchor = clean.match(/webhook/i) || { index: 0 };
+  const anchor = rawBodyMatch;
   return [
     {
       line: lineOfIndex(original, anchor.index),

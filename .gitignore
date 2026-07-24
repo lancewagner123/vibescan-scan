@@ -8,3 +8,7 @@ vibescan-report.json
 # (used by the secret-env-committed / secret-hardcoded-generic checks) -- it must be
 # tracked in this repo, not excluded by the blanket ".env" rule above.
 !test/fixtures/vulnerable-demo-app/.env
+
+# Same reasoning for the synthetic-realistic-app fixture's fake .env (cross-check
+# interaction testing, see its README.md).
+!test/fixtures/synthetic-realistic-app/.env

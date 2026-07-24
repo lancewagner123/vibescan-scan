@@ -280,6 +280,21 @@ test('regression-samples/router-use-guard-protected.js: routes guarded by a prec
   );
 });
 
+test('regression-samples/inline-camelcase-auth-arg.js: camelCase inline/concat/chained auth args (requireAuth) are not flagged', async () => {
+  regressionSamplesFindings = regressionSamplesFindings || (await scanRepo(REGRESSION_SAMPLES_ROOT));
+
+  const missingAuthFindings = regressionSamplesFindings.filter(
+    (finding) => finding.checkId === 'missing-auth-middleware' && finding.file.includes('inline-camelcase-auth-arg.js')
+  );
+  assert.equal(
+    missingAuthFindings.length,
+    0,
+    'expected zero missing-auth-middleware findings for routes protected by an inline camelCase-named ' +
+      `middleware arg like requireAuth -- AUTH_KEYWORD_AS_ARG_RE's word-boundary anchor may have regressed. ` +
+      `Found: ${JSON.stringify(missingAuthFindings)}`
+  );
+});
+
 test('prompt-injection-variants: buildUserMessage() neutralizes every reachable injected tag/instruction', async () => {
   const findings = await scanRepo(PROMPT_INJECTION_ROOT);
   assert.ok(Array.isArray(findings), 'scanRepo() must resolve to an array of raw findings');
