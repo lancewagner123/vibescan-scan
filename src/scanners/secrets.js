@@ -417,6 +417,42 @@ const RANDOM_TOKEN_SOURCE_EXTENSIONS = ['.js', '.jsx', '.ts', '.tsx', '.mjs', '.
 // substring, including "resetToken"/"authToken"/"csrfToken" (all contain "token").
 const TOKEN_ISH_NAME_SRC = '[\\w$.]*(?:token|session[_-]?id|api[_-]?key|secret|nonce|csrf)[\\w$]*';
 
+// A false-positive audit (round 2, 2026-07-24) found the substring vocabulary above
+// flagging names like "tokenizerSeed" (an NLP mock-data seed -- "token" is just the start
+// of "tokenizer") purely on incidental overlap. The fix is a post-filter, not a regex
+// lookahead baked into TOKEN_ISH_NAME_SRC itself: `(?![a-z])` inside a pattern compiled
+// with the 'i' flag doesn't do what it looks like it does, since `[a-z]` under
+// case-insensitive matching ALSO matches uppercase letters -- it would incorrectly block
+// legitimate names like "resetTokenValue" (the letter after "Token" is a real, wanted
+// uppercase 'V'). Re-checking against the ORIGINAL (un-folded) captured text here keeps
+// the outer regex's case-insensitivity for finding candidates while still doing a real
+// case-SENSITIVE "is this followed by a lowercase letter" check: a keyword occurrence
+// followed by a lowercase letter is embedded inside a longer word (tokenizer, secretary)
+// rather than ending at a real camelCase/separator boundary, and is rejected; a keyword
+// occurrence followed by end-of-name/a digit/an underscore/an uppercase letter is a real
+// boundary and is kept. A name is accepted if ANY of its keyword occurrences clears this
+// check (so "csrfToken" -- where the first, "csrf", already clears it -- doesn't get
+// rejected just because a *different* substring elsewhere wouldn't).
+//
+// This is a real but partial fix: a keyword that lands at a genuine camelCase SEGMENT
+// boundary on BOTH sides (e.g. "gameToken", "animationToken" -- a board-game piece color
+// / a UI animation dedup key, both real false positives found in the same audit) is
+// syntactically indistinguishable from a real "sessionToken"/"authToken" and is not fixed
+// here -- see SECURITY_SCOPE.md's check-11 entry for why that's left as a documented,
+// accepted tradeoff rather than forced closed.
+const TOKEN_ISH_KEYWORD_SEARCH_RE = /(?:token|session[_-]?id|api[_-]?key|secret|nonce|csrf)/gi;
+
+function hasTokenIshKeywordAtBoundary(name) {
+  TOKEN_ISH_KEYWORD_SEARCH_RE.lastIndex = 0;
+  let km;
+  while ((km = TOKEN_ISH_KEYWORD_SEARCH_RE.exec(name)) !== null) {
+    const after = name[km.index + km[0].length];
+    if (!after || !/[a-z]/.test(after)) return true; // real boundary -- not embedded in a longer lowercase word
+    if (km.index === TOKEN_ISH_KEYWORD_SEARCH_RE.lastIndex) TOKEN_ISH_KEYWORD_SEARCH_RE.lastIndex++; // guard zero-width
+  }
+  return false;
+}
+
 // Captures (1) the assigned name and (2) everything up to the end of the statement
 // (next `;` or newline), so the Math.random() call can appear anywhere in the RHS
 // (`Math.random()`, `Math.random().toString(36)`, `Math.random().toString(36).slice(2)`,
@@ -445,6 +481,7 @@ function checkInsecureRandomToken(clean, original) {
   let m;
   while ((m = INSECURE_RANDOM_TOKEN_RE.exec(clean)) !== null) {
     const name = m[1];
+    if (!hasTokenIshKeywordAtBoundary(name)) continue;
     hits.push({
       line: lineOfIndex(original, m.index),
       snippet: snippetAt(original, m.index),
@@ -465,21 +502,23 @@ function checkInsecureRandomToken(clean, original) {
 // and a same-statement Math.random() call, then joins the bracket key's literal parts back
 // together (same join approach as findStringConcatChains) and tests the joined name against
 // the same token-ish keyword vocabulary TOKEN_ISH_NAME_SRC uses.
-const BRACKET_KEY_EXPR_SRC = "(?:['\"][\\w$]*['\"]\\s*\\+\\s*)*['\"][\\w$]*['\"]";
+// Was quote-only (`'`/`"`) -- a bracket key written as a template literal (`` user[`sessionId`]
+// = ... ``, an entirely ordinary modern-JS stylistic choice, not exotic obfuscation) fell
+// outside that character class and was invisible here. Fixed 2026-07-24 (round 2 evasion
+// audit): backtick added to both quote-char classes.
+const BRACKET_KEY_EXPR_SRC = "(?:['\"`][\\w$]*['\"`]\\s*\\+\\s*)*['\"`][\\w$]*['\"`]";
 const INSECURE_RANDOM_TOKEN_BRACKET_RE = new RegExp(
   `\\[\\s*(${BRACKET_KEY_EXPR_SRC})\\s*\\]\\s*(?::|=(?!=|>))\\s*([^;\\n]*\\bMath\\.random\\(\\)[^;\\n]*)`,
   'g',
 );
-const TOKEN_ISH_KEYWORD_RE = /(?:token|session[_-]?id|api[_-]?key|secret|nonce|csrf)/i;
-
 function checkInsecureRandomTokenBracket(clean, original) {
   const hits = [];
   INSECURE_RANDOM_TOKEN_BRACKET_RE.lastIndex = 0;
   let m;
   while ((m = INSECURE_RANDOM_TOKEN_BRACKET_RE.exec(clean)) !== null) {
     const keyExpr = m[1];
-    const joined = [...keyExpr.matchAll(/['"]([\w$]*)['"]/g)].map((mm) => mm[1]).join('');
-    if (!TOKEN_ISH_KEYWORD_RE.test(joined)) continue;
+    const joined = [...keyExpr.matchAll(/['"`]([\w$]*)['"`]/g)].map((mm) => mm[1]).join('');
+    if (!hasTokenIshKeywordAtBoundary(joined)) continue;
     hits.push({
       line: lineOfIndex(original, m.index),
       snippet: snippetAt(original, m.index),
@@ -500,8 +539,15 @@ function checkInsecureRandomTokenBracket(clean, original) {
 // token-ish name assigned to a bare same-file function call, resolves that function's
 // return expression (lookupFunctionReturnExpr, shared with static-checks.js's checks 5/13/
 // 14/15 via util.js), and flags it if the return expression itself contains Math.random().
+// Callee capture group allows one optional `.member` hop (`ClassName.method`) as well as
+// a bare identifier -- added 2026-07-24 (round 2 evasion audit) so a static-class-method
+// call site (`const resetToken = TokenGen.generate();`) is recognized at all; previously
+// the bare-identifier-only pattern never matched the statement in the first place since a
+// member expression has a '.' where the regex expected '(' to follow immediately.
+// lookupFunctionReturnExpr (util.js) dispatches a dotted callee name to its own
+// class-static-method lookup.
 const TOKEN_ASSIGNED_TO_CALL_RE = new RegExp(
-  `(${TOKEN_ISH_NAME_SRC})\\s*(?::|=(?!=|>))\\s*(?:await\\s+)?([A-Za-z_$][\\w$]*)\\s*\\(([^()]*)\\)\\s*;`,
+  `(${TOKEN_ISH_NAME_SRC})\\s*(?::|=(?!=|>))\\s*(?:await\\s+)?([A-Za-z_$][\\w$]*(?:\\.[A-Za-z_$][\\w$]*)?)\\s*\\(([^()]*)\\)\\s*;`,
   'gi',
 );
 
@@ -511,6 +557,7 @@ function checkInsecureRandomTokenViaHelperCall(clean, original) {
   let m;
   while ((m = TOKEN_ASSIGNED_TO_CALL_RE.exec(clean)) !== null) {
     const name = m[1];
+    if (!hasTokenIshKeywordAtBoundary(name)) continue;
     const calleeName = m[2];
     const returnExpr = lookupFunctionReturnExpr(clean, calleeName);
     if (!returnExpr || !/\bMath\.random\(\)/.test(returnExpr)) continue;
@@ -570,7 +617,12 @@ function scanInsecureRandomTokens(repoPath) {
 // SQL and route-path checks) already resolves both a bare literal argument AND an
 // identifier chain through any number of `const/let/var` hops and `+` concatenations back
 // to a single string, so it's reused here rather than duplicating that resolution logic.
-const CREATE_HASH_CALL_RE = /crypto\s*\.\s*createHash\s*\(\s*([^)]*)\)/gi;
+// Was dot-notation only (`crypto.createHash(`) -- a computed/bracket member access on the
+// METHOD NAME itself (`crypto['createHash'](...)`) never contains that literal text, so
+// the whole call was invisible before the password-context heuristics below even got a
+// chance to run. Fixed 2026-07-24 (round 2 evasion audit): also matches
+// `crypto['createHash'](...)` / `crypto["createHash"](...)`.
+const CREATE_HASH_CALL_RE = /crypto\s*(?:\.\s*createHash|\[\s*['"]createHash['"]\s*\])\s*\(\s*([^)]*)\)/gi;
 const PASSWORD_CONTEXT_RE = /\b(password|passwd|pwd)\b/i;
 const AUTH_FILE_PATH_RE = /(^|\/)(auth|login|log-in|signup|sign-up|register|registration)([./]|$)/i;
 
