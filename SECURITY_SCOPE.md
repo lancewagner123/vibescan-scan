@@ -107,6 +107,18 @@ Documented here so the tool never silently implies more coverage than it has:
   positive), and, symmetrically, a decorative helper that happens to `throw` for
   unrelated reasons could still suppress a genuinely unauthenticated route (a false
   negative). Neither direction is verified against what the "auth" code actually does.
+  Two further gaps found in a follow-up audit (2026-07-24), on ordinary idiomatic
+  Express code rather than a crafted evasion sample:
+  - **False negative on chained route syntax:** `router.route('/admin/dashboard').get(handler)`
+    — Express's standard chainable form — produces zero findings even with no auth check
+    at all. The scanner only recognizes a route path and its HTTP-method call when both
+    appear in one `.method(...)` invocation; the chained form splits them across two
+    calls and neither is reassembled.
+  - **False positive on router-level middleware:** `router.use(requireAuth)` applied once
+    at the top of a router file, guarding every route defined below it, is not
+    recognized. Each `.get`/`.post` call is inspected in isolation, with no awareness of
+    a preceding `router.use(...)`, so every route in a file secured this very common way
+    gets flagged as missing auth.
 - **Supabase RLS (check 8):** the nested-key RLS pattern only matches one level of `{
   ... }` nesting with `enabled: false` textually close to the `rls`/`row_level_security`
   key; a differently-shaped toggle (a string value like `"disabled"`, a boolean stored
