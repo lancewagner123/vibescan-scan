@@ -19,6 +19,14 @@
   "engines": {
     "node": ">=22"
   },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lancewagner123/vibescan-scan.git"
+  },
+  "homepage": "https://github.com/lancewagner123/vibescan-scan#readme",
+  "bugs": {
+    "url": "https://github.com/lancewagner123/vibescan-scan/issues"
+  },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.32.0"
   }
