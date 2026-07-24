@@ -28,14 +28,29 @@ const SEVERITY_LABELS = {
 // attacker who can mass-assign arbitrary fields onto a model (isAdmin, role, verified,
 // balance) is exploiting a privilege-escalation/access-control gap, not a plain data-shape
 // bug, and an incomplete fix (e.g. an allowlist that misses one sensitive field) can look
-// like it closed the hole while leaving exactly that field still overwritable. This list
-// is render-level and does not depend on the model remembering or restating anything.
+// like it closed the hole while leaving exactly that field still overwritable.
+// weak-password-hashing (check 12) joins this list for the same "looks successful but
+// isn't" shape as sql-string-concatenation/stripe-webhook-unverified: a diff that swaps
+// the hash-creation call (e.g. crypto.createHash('md5') -> bcrypt.hash) only touches the
+// snippet the fix generator can see, not the corresponding login/verify code path
+// elsewhere in the file or codebase that still compares against the old hash format —
+// an incomplete fix here can look like it closed the hole while login silently breaks or
+// still accepts the weak hash. insecure-random-token (check 11) joins for the same
+// reason plus its own auth-adjacent angle: the values this check flags (session ids,
+// password-reset tokens, API keys, CSRF nonces) are themselves part of an
+// authentication/access-control mechanism, so swapping in crypto.randomBytes/randomUUID
+// without checking every place that consumes the old token's length/encoding/format
+// assumptions can silently break session/reset/CSRF flows elsewhere in the codebase.
+// This list is render-level and does not depend on the model remembering or restating
+// anything.
 const HIGH_RISK_FIX_CHECK_IDS = new Set([
   'missing-auth-middleware',
   'supabase-rls-disabled',
   'sql-string-concatenation',
   'stripe-webhook-unverified',
   'mass-assignment',
+  'weak-password-hashing',
+  'insecure-random-token',
 ]);
 
 const SCOPE_DISCLAIMER =

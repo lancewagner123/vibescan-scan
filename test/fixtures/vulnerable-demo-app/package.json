@@ -2,7 +2,7 @@
   "name": "vulnerable-demo-app",
   "version": "1.0.0",
   "private": true,
-  "description": "VibeScan test fixture: an intentionally vulnerable demo app. DO NOT DEPLOY THIS. Seeds exactly one instance of each of the 10 v1 checks listed in docs/CHECK_CATALOG.md so detection is countable in test/e2e.test.js.",
+  "description": "VibeScan test fixture: an intentionally vulnerable demo app. DO NOT DEPLOY THIS. Seeds exactly one instance of each of the 15 checks listed in docs/CHECK_CATALOG.md so detection is countable in test/e2e.test.js.",
   "main": "app.js",
   "scripts": {
     "start": "node app.js"

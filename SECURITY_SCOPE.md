@@ -55,15 +55,23 @@ guess, not a verification:
   this tool that merges code without a human in the loop.
 - **Findings tagged `authz` (missing-auth-middleware, supabase-rls-disabled), the
   `sql-string-concatenation` and `stripe-webhook-unverified` checks, and (as of v0.2.0)
-  `mass-assignment` deserve extra scrutiny before you apply a suggested diff.** These are
-  exactly the categories where an incomplete fix is most likely to *look* successful while
-  leaving a real hole open (or breaking legitimate access) — get a second, human set of
-  eyes on any diff in these categories specifically, not just a glance. `mass-assignment`
-  is grouped with the authz checks here (even though its own `category` field is
-  `injection`, per `docs/FINDINGS_SCHEMA.md`) because the underlying risk is the same
-  shape: an attacker using the finding to set fields they were never meant to control
-  (`isAdmin`, `role`, `verified`, `balance`), which is privilege escalation in effect even
-  though the raw pattern being matched is "unallowlisted assignment," not an auth check.
+  `mass-assignment`, `weak-password-hashing`, and `insecure-random-token` deserve extra
+  scrutiny before you apply a suggested diff.** These are exactly the categories where an
+  incomplete fix is most likely to *look* successful while leaving a real hole open (or
+  breaking legitimate access) — get a second, human set of eyes on any diff in these
+  categories specifically, not just a glance. `mass-assignment` is grouped with the authz
+  checks here (even though its own `category` field is `injection`, per
+  `docs/FINDINGS_SCHEMA.md`) because the underlying risk is the same shape: an attacker
+  using the finding to set fields they were never meant to control (`isAdmin`, `role`,
+  `verified`, `balance`), which is privilege escalation in effect even though the raw
+  pattern being matched is "unallowlisted assignment," not an auth check.
+  `weak-password-hashing` and `insecure-random-token` (both `category: 'crypto'`) join for
+  the same "looks successful but isn't" reason: a diff that swaps the hash-creation call
+  or the random-token source only touches the snippet the fix generator can see, not the
+  corresponding login/verify code path (for `weak-password-hashing`) or every other place
+  that consumes the token's length/encoding/format assumptions (for
+  `insecure-random-token`) — either can leave the real vulnerability open, or break a
+  working login/session/reset flow, while the diff itself looks like a clean fix.
 - If a future version of VibeScan adds automatic pull-request creation, that PR will be
   clearly labeled as an unreviewed, AI-generated suggestion requiring human security
   review before merge, and will not be opened automatically for high/critical

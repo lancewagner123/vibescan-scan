@@ -1,7 +1,7 @@
 'use strict';
 
 // VibeScan test fixture -- intentionally vulnerable demo app. DO NOT DEPLOY.
-// See ./README.md for the full map of which file seeds which of the 10 v1 checks.
+// See ./README.md for the full map of which file seeds which of the 15 checks.
 
 const express = require('express');
 const cors = require('cors');

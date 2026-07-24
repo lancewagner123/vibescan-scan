@@ -4,7 +4,7 @@ Each scanner module returns an array of objects matching exactly:
 
 {
   "id": "string, stable slug, e.g. 'secret-hardcoded-stripe-key-a1b2'",
-  "checkId": "string, one of the 10 ids in CHECK_CATALOG.md",
+  "checkId": "string, one of the 15 ids in CHECK_CATALOG.md",
   "severity": "critical" | "high" | "medium" | "low" | "info",
   "category": "secret" | "injection" | "authz" | "config" | "dependency" | "crypto",
   "file": "path relative to scanned repo root",

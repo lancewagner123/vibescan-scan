@@ -464,7 +464,7 @@ function scanInsecureRandomTokens(repoPath) {
       findings.push({
         id: makeId(CHECK_INSECURE_RANDOM_TOKEN, [repoRelPath, String(hit.line), hit.snippet]),
         checkId: CHECK_INSECURE_RANDOM_TOKEN,
-        severity: 'critical',
+        severity: 'high',
         category: 'crypto',
         file: repoRelPath,
         line: hit.line,
@@ -538,7 +538,7 @@ function scanWeakPasswordHashing(repoPath) {
       findings.push({
         id: makeId(CHECK_WEAK_PASSWORD_HASHING, [repoRelPath, String(hit.line), hit.snippet]),
         checkId: CHECK_WEAK_PASSWORD_HASHING,
-        severity: 'critical',
+        severity: 'high',
         category: 'crypto',
         file: repoRelPath,
         line: hit.line,
