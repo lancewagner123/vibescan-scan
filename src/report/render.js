@@ -23,20 +23,26 @@ const SEVERITY_LABELS = {
 // stripe-webhook-unverified are named explicitly because an incomplete fix in either can
 // *look* successful (still-injectable SQL hidden inside a quoted literal; a webhook
 // handler that now calls something but not the real signature check) while leaving the
-// vulnerability open, or can break legitimate access. This list is render-level and does
-// not depend on the model remembering or restating anything.
+// vulnerability open, or can break legitimate access. mass-assignment (check 13, added in
+// v0.2.0) joins this list for the same underlying reason as the authz checks above: an
+// attacker who can mass-assign arbitrary fields onto a model (isAdmin, role, verified,
+// balance) is exploiting a privilege-escalation/access-control gap, not a plain data-shape
+// bug, and an incomplete fix (e.g. an allowlist that misses one sensitive field) can look
+// like it closed the hole while leaving exactly that field still overwritable. This list
+// is render-level and does not depend on the model remembering or restating anything.
 const HIGH_RISK_FIX_CHECK_IDS = new Set([
   'missing-auth-middleware',
   'supabase-rls-disabled',
   'sql-string-concatenation',
   'stripe-webhook-unverified',
+  'mass-assignment',
 ]);
 
 const SCOPE_DISCLAIMER =
-  '_VibeScan checks for 10 specific, high-signal static-analysis patterns only — not a ' +
+  '_VibeScan checks for 15 specific, high-signal static-analysis patterns only — not a ' +
   'full security audit, not dynamic testing, no compliance coverage. See SECURITY_SCOPE.md._';
 
-const TERMINAL_SCOPE_NOTE = '(VibeScan checks 10 known patterns only — not a full audit. See SECURITY_SCOPE.md.)';
+const TERMINAL_SCOPE_NOTE = '(VibeScan checks 15 known patterns only — not a full audit. See SECURITY_SCOPE.md.)';
 
 /**
  * @param {{summary?: object, findings?: object[]}} triageOutput
@@ -160,7 +166,7 @@ function renderMarkdown(triageOutput) {
   }
 
   if (total === 0) {
-    lines.push('No issues found among VibeScan\'s 10 static checks.');
+    lines.push('No issues found among VibeScan\'s 15 static checks.');
     lines.push('');
     lines.push(
       'This does not mean your app is secure — VibeScan only looks for a fixed, narrow ' +

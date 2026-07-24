@@ -401,6 +401,90 @@ const CANNED_TEMPLATES = {
       'and re-test. If no fixed version exists yet, check whether the vulnerable code path is actually reachable ' +
       'in your usage and consider a temporary workaround or an alternative package.',
   },
+  'insecure-random-token': {
+    title: 'A security-sensitive token is generated with Math.random(), which is predictable',
+    explanation:
+      'This code builds something that looks like a session id, password-reset token, API key, secret, nonce, ' +
+      'or CSRF token using Math.random() (often chained with .toString(36) to make it look like a random ' +
+      'string). Math.random() is not cryptographically secure — it\'s meant for things like shuffling a UI ' +
+      'animation, not for anything a security decision depends on.',
+    attackerImpact:
+      'Math.random()\'s internal state can be predicted or reconstructed from observed output, in some engines ' +
+      'trivially. An attacker who figures this out can guess or forge valid session ids, password-reset tokens, ' +
+      'or CSRF tokens — letting them hijack another user\'s session, reset someone else\'s password, or forge a ' +
+      'request as if it came from a legitimate user.',
+    fixDescription:
+      'Use a cryptographically secure random source instead: `crypto.randomBytes(32).toString(\'hex\')` or ' +
+      '`crypto.randomUUID()` in Node.js. Any value used for a session id, token, secret, nonce, or CSRF ' +
+      'protection should come from one of these, never from Math.random().',
+  },
+  'weak-password-hashing': {
+    title: 'Passwords are hashed with MD5 or SHA-1 instead of a real password-hashing algorithm',
+    explanation:
+      'This code hashes a password using crypto.createHash(\'md5\') or crypto.createHash(\'sha1\'). Both are ' +
+      'fast, general-purpose digests designed for things like checksums — not for storing passwords. Neither ' +
+      'includes a per-user salt or a deliberately slow work factor, the two things that make a password hash ' +
+      'actually resistant to cracking.',
+    attackerImpact:
+      'If your user database is ever breached (a common event, not a rare one), an attacker can crack MD5/SHA-1 ' +
+      'password hashes at billions of guesses per second on ordinary GPU hardware — recovering most real-world ' +
+      'passwords in hours or less, especially any that appear in common password lists. A modern algorithm ' +
+      'makes the same breach far less damaging by making each guess expensive.',
+    fixDescription:
+      'Use bcrypt, scrypt, or argon2 instead — each automatically salts the password and lets you tune how ' +
+      'expensive a single guess is. Never use md5/sha1/sha256 alone for password storage, and rehash existing ' +
+      'passwords the next time each user successfully logs in.',
+  },
+  'mass-assignment': {
+    title: 'The entire request body is written straight onto a database model, with no allowlist',
+    explanation:
+      'This code passes req.body or req.query, in its entirety, directly into a model\'s create/update/save ' +
+      'call, a `new Model(...)` constructor, or Object.assign() onto an existing record — with no destructuring ' +
+      'or allowlist limiting which fields are actually allowed to be set this way.',
+    attackerImpact:
+      'An attacker can add extra fields to the request that were never meant to be user-editable — things like ' +
+      '`isAdmin`, `role`, `verified`, or `accountBalance` — and have them silently written to the database ' +
+      'alongside the legitimate fields the form intended. This is a real, well-documented way attackers grant ' +
+      'themselves admin access or bypass verification/paywall checks on apps that looked otherwise fine.',
+    fixDescription:
+      'Explicitly destructure or allowlist only the specific fields this operation is supposed to accept (e.g. ' +
+      '`Model.create({ name: req.body.name, email: req.body.email })`) instead of passing req.body/req.query ' +
+      'through whole. Most ORMs also support a schema-level allowlist (e.g. Mongoose\'s `select`, or an explicit ' +
+      'DTO/validation layer) — use one so a new sensitive field added later doesn\'t silently become mass-' +
+      'assignable again.',
+  },
+  'insecure-cookie-flags': {
+    title: 'A session/auth cookie is set without httpOnly and secure flags',
+    explanation:
+      'This code sets what looks like a session or authentication cookie (by its name or the value being ' +
+      'assigned to it) without an options object at all, or with an options object that\'s missing ' +
+      '`httpOnly: true` and/or `secure: true`.',
+    attackerImpact:
+      'Without httpOnly, any JavaScript that runs on your page — including injected via an XSS bug elsewhere — ' +
+      'can read this cookie directly and send it to an attacker, who can then impersonate that user with no ' +
+      'further work. Without secure, the same cookie can be sent over a plain, unencrypted HTTP connection, ' +
+      'where it can be intercepted on public wifi or by anything sitting on the network path.',
+    fixDescription:
+      'Always set both flags on session/auth cookies: `res.cookie(name, value, { httpOnly: true, secure: true, ' +
+      'sameSite: \'lax\' })` (or `\'strict\'`/`\'none\'` depending on your cross-site needs). httpOnly stops ' +
+      'client-side JavaScript from reading the cookie; secure stops it from ever being sent over plain HTTP.',
+  },
+  'open-redirect': {
+    title: 'A redirect sends users to a URL taken directly from the request, with no allowlist',
+    explanation:
+      'This code calls res.redirect() with a target URL that comes directly (or through one variable hop) from ' +
+      'req.query, req.body, or req.params — with no check that the destination is one of a fixed set of ' +
+      'internal paths your app actually intends to redirect to.',
+    attackerImpact:
+      'An attacker can craft a link that points at your trusted domain but, when clicked, silently forwards the ' +
+      'victim on to an attacker-controlled site — a classic phishing technique that\'s far more convincing ' +
+      'because the initial link genuinely is your real domain. It can also be chained with OAuth-style flows to ' +
+      'steal tokens intended only for your own app.',
+    fixDescription:
+      'Validate the redirect target against a fixed allowlist of known-safe internal paths (or require it to ' +
+      'start with `/` and reject anything containing `//` or a scheme, to rule out `//evil.com`-style tricks) ' +
+      'before calling res.redirect() — never redirect to a URL taken from user input unchecked.',
+  },
 };
 
 /**

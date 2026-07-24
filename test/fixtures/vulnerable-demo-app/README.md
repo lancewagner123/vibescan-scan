@@ -6,8 +6,8 @@ key format, seeded specifically so VibeScan's pattern-based checks have somethin
 unambiguous to find.
 
 This app exists purely as a scan target for `test/e2e.test.js`. It seeds **exactly one**
-clear instance of each of the 10 checks in `docs/CHECK_CATALOG.md`, so a passing e2e run
-means "all 10 checkIds showed up at least once," never "some subset happened to match."
+clear instance of each of the 15 checks in `docs/CHECK_CATALOG.md`, so a passing e2e run
+means "all 15 checkIds showed up at least once," never "some subset happened to match."
 
 ## Check -> file map
 
@@ -23,6 +23,11 @@ means "all 10 checkIds showed up at least once," never "some subset happened to 
 | 8 | `supabase-rls-disabled` | `config/supabase-config.js` (`rowLevelSecurity: false`) AND `client/src/lib/supabaseClient.js` (service_role key in client-side-looking code) |
 | 9 | `stripe-webhook-unverified` | `routes/webhooks.js` -- `POST /webhooks/stripe` never calls `stripe.webhooks.constructEvent()` |
 | 10 | `vulnerable-dependency` | `package.json` -- `lodash` pinned to `4.17.15`, which has real published high-severity CVEs (CVE-2020-8203, CVE-2021-23337) fixed in 4.17.21 |
+| 11 | `insecure-random-token` | `routes/auth.js` -- `POST /auth/login` generates the session token via `Math.random().toString(36)` instead of `crypto.randomBytes`/`crypto.randomUUID` |
+| 12 | `weak-password-hashing` | `routes/auth.js` -- `POST /auth/signup` (and `/auth/login`) hash the password with `crypto.createHash('sha1')` instead of bcrypt/scrypt/argon2 |
+| 13 | `mass-assignment` | `routes/profile.js` -- `POST /profile/users` passes `req.body` straight through to `User.create(req.body)` with no field allowlist |
+| 14 | `insecure-cookie-flags` | `routes/auth.js` -- `POST /auth/login` sets the `sessionId` cookie via `res.cookie('sessionId', sessionId)` with no options object, so no `httpOnly`/`secure`/`sameSite` |
+| 15 | `open-redirect` | `routes/redirect.js` -- `GET /go` redirects to `req.query.url` (one variable hop) with no allowlist/validation |
 
 ## Prompt-injection test fixture (not a real check)
 

@@ -5,11 +5,10 @@
 // real triage pipeline (src/triage) and checks the output against the Triage Output
 // Schema documented in docs/FINDINGS_SCHEMA.md.
 //
-// NOTE: src/scanners and src/triage do not exist yet as of the writing of this file --
-// they're built by other agents in this same Build phase. This file is expected to fail
-// until those modules land; it exists now so their authors have a concrete, precise
-// target to build against. What matters today is that this file is syntactically valid
-// and that its assertions are exact about which 10 checkIds must be found.
+// NOTE: src/scanners and src/triage were built by other agents in earlier Build phases;
+// this file's assertions are exact about which checkIds must be found. As of v0.2.0 the
+// fixture seeds all 15 checks from docs/CHECK_CATALOG.md (the original 10, plus checks
+// 11-15 added in routes/auth.js, routes/profile.js, and routes/redirect.js).
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
@@ -20,8 +19,8 @@ const { triage } = require('../src/triage');
 
 const FIXTURE_PATH = path.join(__dirname, 'fixtures', 'vulnerable-demo-app');
 
-// Exactly the 10 checkIds in docs/CHECK_CATALOG.md, no more, no less -- the fixture
-// seeds exactly one clear instance of each.
+// Exactly the 15 checkIds in docs/CHECK_CATALOG.md, no more, no less -- the fixture
+// seeds at least one clear instance of each.
 const EXPECTED_CHECK_IDS = [
   'secret-hardcoded-generic',
   'secret-env-committed',
@@ -33,11 +32,16 @@ const EXPECTED_CHECK_IDS = [
   'supabase-rls-disabled',
   'stripe-webhook-unverified',
   'vulnerable-dependency',
+  'insecure-random-token',
+  'weak-password-hashing',
+  'mass-assignment',
+  'insecure-cookie-flags',
+  'open-redirect',
 ];
 
 const VALID_SEVERITIES = new Set(['critical', 'high', 'medium', 'low']);
 
-test('scanRepo() finds all 10 seeded VibeScan checks in the vulnerable-demo-app fixture', async () => {
+test('scanRepo() finds all 15 seeded VibeScan checks in the vulnerable-demo-app fixture', async () => {
   const findings = await scanRepo(FIXTURE_PATH);
 
   assert.ok(Array.isArray(findings), 'scanRepo() must resolve to an array of raw findings');
@@ -49,7 +53,7 @@ test('scanRepo() finds all 10 seeded VibeScan checks in the vulnerable-demo-app 
   assert.deepEqual(
     missing,
     [],
-    `expected all 10 checkIds to be found at least once; missing: [${missing.join(', ')}]. ` +
+    `expected all 15 checkIds to be found at least once; missing: [${missing.join(', ')}]. ` +
       `Found: [${[...foundCheckIds].join(', ')}]`
   );
 
@@ -94,7 +98,7 @@ test('triage() produces Triage-Output-Schema-shaped output from the fixture find
   assert.ok(Array.isArray(result.findings), 'triage output must have a findings array');
   assert.ok(
     result.findings.length > 0,
-    'triage output findings array must not be empty for a fixture with 10 seeded issues'
+    'triage output findings array must not be empty for a fixture with 15 seeded issues'
   );
 
   for (const finding of result.findings) {
@@ -130,7 +134,7 @@ test('triage() produces Triage-Output-Schema-shaped output from the fixture find
 
   // Every raw checkId the scanner found should be traceable to at least one triaged
   // finding's sourceCheckIds -- triage may consolidate, but it must not silently drop one
-  // of the 10 seeded issues.
+  // of the 15 seeded issues.
   const rawCheckIds = new Set(findings.map((finding) => finding.checkId));
   const triagedCheckIds = new Set(result.findings.flatMap((finding) => finding.sourceCheckIds));
   const dropped = [...rawCheckIds].filter((checkId) => !triagedCheckIds.has(checkId));

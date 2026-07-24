@@ -20,10 +20,13 @@ const {
   isGitRepo,
   guardGitHistoryScope,
   findStringConcatChains,
+  stripComments,
 } = require('./util');
 
 const CHECK_HARDCODED = 'secret-hardcoded-generic';
 const CHECK_ENV_COMMITTED = 'secret-env-committed';
+const CHECK_INSECURE_RANDOM_TOKEN = 'insecure-random-token';
+const CHECK_WEAK_PASSWORD_HASHING = 'weak-password-hashing';
 
 // --- Known key-format patterns (checked one line at a time) --------------------------
 
@@ -389,6 +392,164 @@ function scanHardcodedSecrets(repoPath) {
   return findings;
 }
 
+// --- Check 11: insecure-random-token -------------------------------------------------
+//
+// Math.random() is not cryptographically secure -- it's seeded from predictable state
+// and its output can be reconstructed/guessed given enough samples, so anything built
+// from it (session ids, password-reset tokens, API keys, CSRF nonces, ...) can be
+// forged or predicted by an attacker. This check flags Math.random() -- including the
+// extremely common `Math.random().toString(36)` idiom used to turn the float into an
+// alphanumeric-looking string -- flowing into an assignment/property whose name
+// suggests it's meant to be a security-sensitive token.
+//
+// Only JS/TS source is scanned: Math.random()/crypto are Node/browser JS APIs, so
+// other languages walked by the hardcoded-secret check above can't produce this pattern.
+const RANDOM_TOKEN_SOURCE_EXTENSIONS = ['.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs'];
+
+// Deliberately loose substring match, same style as GENERIC_ENTROPY_RE above: matches
+// any identifier/property chain containing one of these security-token-ish words,
+// however it's cased (resetToken, reset_token, sessionId, session_id, apiKey, api_key,
+// authToken, csrfToken, mySecret, nonce, ...). `session[_-]?id` and `api[_-]?key` need
+// their own alternatives (neither substring is covered by the others); the rest
+// (token/secret/nonce/csrf) already cover every other name in the spec as a plain
+// substring, including "resetToken"/"authToken"/"csrfToken" (all contain "token").
+const TOKEN_ISH_NAME_SRC = '[\\w$.]*(?:token|session[_-]?id|api[_-]?key|secret|nonce|csrf)[\\w$]*';
+
+// Captures (1) the assigned name and (2) everything up to the end of the statement
+// (next `;` or newline), so the Math.random() call can appear anywhere in the RHS
+// (`Math.random()`, `Math.random().toString(36)`, `Math.random().toString(36).slice(2)`,
+// etc.) without needing a separate pattern per chained-method variant. `=(?!=|>)` keeps
+// this from matching `==`/`===` comparisons or `=>` arrow functions; `:` additionally
+// covers object-literal property shorthand (`resetToken: Math.random()...`).
+const INSECURE_RANDOM_TOKEN_RE = new RegExp(
+  `(${TOKEN_ISH_NAME_SRC})\\s*(?::|=(?!=|>))\\s*([^;\\n]*\\bMath\\.random\\(\\)[^;\\n]*)`,
+  'gi',
+);
+
+function lineOfIndex(text, index) {
+  return text.slice(0, index).split(/\r?\n/).length;
+}
+
+function snippetAt(text, index, len = 200) {
+  const lineStart = text.lastIndexOf('\n', index) + 1;
+  let lineEnd = text.indexOf('\n', index);
+  if (lineEnd === -1) lineEnd = text.length;
+  return text.slice(lineStart, lineEnd).trim().slice(0, len);
+}
+
+function checkInsecureRandomToken(clean, original) {
+  const hits = [];
+  INSECURE_RANDOM_TOKEN_RE.lastIndex = 0;
+  let m;
+  while ((m = INSECURE_RANDOM_TOKEN_RE.exec(clean)) !== null) {
+    const name = m[1];
+    hits.push({
+      line: lineOfIndex(original, m.index),
+      snippet: snippetAt(original, m.index),
+      rawMessage: `Math.random() is used to build the value assigned to "${name}", a name that suggests a security-sensitive token (session id, reset token, API key, secret, nonce, or CSRF token). Math.random() is not cryptographically secure and its output is predictable, so tokens built from it can be guessed -- use crypto.randomBytes(n).toString('hex') or crypto.randomUUID() instead.`,
+    });
+  }
+  return hits;
+}
+
+function scanInsecureRandomTokens(repoPath) {
+  const findings = [];
+  const files = walkFiles(repoPath, { extensions: RANDOM_TOKEN_SOURCE_EXTENSIONS });
+  for (const filePath of files) {
+    const original = readTextFile(filePath);
+    if (!original) continue;
+    const clean = stripComments(original);
+    const repoRelPath = path.relative(repoPath, filePath).split(path.sep).join('/');
+    for (const hit of checkInsecureRandomToken(clean, original)) {
+      findings.push({
+        id: makeId(CHECK_INSECURE_RANDOM_TOKEN, [repoRelPath, String(hit.line), hit.snippet]),
+        checkId: CHECK_INSECURE_RANDOM_TOKEN,
+        severity: 'critical',
+        category: 'crypto',
+        file: repoRelPath,
+        line: hit.line,
+        snippet: hit.snippet.slice(0, 200),
+        rawMessage: hit.rawMessage,
+      });
+    }
+  }
+  return findings;
+}
+
+// --- Check 12: weak-password-hashing --------------------------------------------------
+//
+// crypto.createHash('md5')/crypto.createHash('sha1') are fast, unsalted digests -- fine
+// for checksums/cache-busting, but catastrophic for password storage: a breached user
+// database becomes fully crackable via rainbow tables/GPU brute force, not just
+// partially. Only flag this in a context that actually looks password-related, so a
+// checksum helper hashing file contents with md5 elsewhere in the codebase isn't swept
+// in.
+const WEAK_HASH_ALGO_RE = /crypto\s*\.\s*createHash\s*\(\s*(['"`])(md5|sha1)\1\s*\)/gi;
+const PASSWORD_CONTEXT_RE = /\b(password|passwd|pwd)\b/i;
+const AUTH_FILE_PATH_RE = /(^|\/)(auth|login|log-in|signup|sign-up|register|registration)([./]|$)/i;
+
+// Scoped to the current statement only (previous ';' up to the next ';', inclusive of
+// the whole chain in between -- so a multi-line `.createHash(...).update(...).digest
+// (...)` chain is still captured whole) rather than a blind fixed-size character window.
+// A window measured in raw characters bleeds into whatever unrelated code/comments
+// happen to sit within N chars before/after in a densely-packed file (e.g. the next
+// function over, or a comment mentioning "password" in passing) -- statement scoping
+// ties the check to "is the actual value being hashed here named password-ish", which is
+// what the check is meant to detect.
+function currentStatementWindow(text, index) {
+  const priorSemi = text.lastIndexOf(';', index);
+  const start = priorSemi === -1 ? 0 : priorSemi + 1;
+  let end = text.indexOf(';', index);
+  if (end === -1) end = text.length;
+  return text.slice(start, end + 1);
+}
+
+function checkWeakPasswordHashing(clean, original, repoRelPath) {
+  const hits = [];
+  const fileLooksAuthy = AUTH_FILE_PATH_RE.test(repoRelPath);
+  WEAK_HASH_ALGO_RE.lastIndex = 0;
+  let m;
+  while ((m = WEAK_HASH_ALGO_RE.exec(clean)) !== null) {
+    const algo = m[2].toLowerCase();
+    const statement = currentStatementWindow(clean, m.index);
+    const nearbyLooksPasswordy = PASSWORD_CONTEXT_RE.test(statement);
+    if (!nearbyLooksPasswordy && !fileLooksAuthy) continue; // no password-ish signal at all -- likely a checksum/etag use, leave it alone
+    const reason = nearbyLooksPasswordy
+      ? 'a nearby variable/argument name suggests it is hashing a password'
+      : `the file ("${repoRelPath}") looks like an auth/login/signup/register route or module`;
+    hits.push({
+      line: lineOfIndex(original, m.index),
+      snippet: snippetAt(original, m.index),
+      rawMessage: `crypto.createHash('${algo}') is used where ${reason} -- ${algo.toUpperCase()} is fast and unsalted, so a breached password database hashed this way is fully crackable at scale. Use bcrypt, scrypt, or argon2 instead.`,
+    });
+  }
+  return hits;
+}
+
+function scanWeakPasswordHashing(repoPath) {
+  const findings = [];
+  const files = walkFiles(repoPath, { extensions: RANDOM_TOKEN_SOURCE_EXTENSIONS });
+  for (const filePath of files) {
+    const original = readTextFile(filePath);
+    if (!original) continue;
+    const clean = stripComments(original);
+    const repoRelPath = path.relative(repoPath, filePath).split(path.sep).join('/');
+    for (const hit of checkWeakPasswordHashing(clean, original, repoRelPath)) {
+      findings.push({
+        id: makeId(CHECK_WEAK_PASSWORD_HASHING, [repoRelPath, String(hit.line), hit.snippet]),
+        checkId: CHECK_WEAK_PASSWORD_HASHING,
+        severity: 'critical',
+        category: 'crypto',
+        file: repoRelPath,
+        line: hit.line,
+        snippet: hit.snippet.slice(0, 200),
+        rawMessage: hit.rawMessage,
+      });
+    }
+  }
+  return findings;
+}
+
 /**
  * @param {string} repoPath - absolute path to the target repo's working tree
  * @param {object} [opts]
@@ -414,6 +575,18 @@ function scan(repoPath, opts = {}) {
     warnings.push(`secrets.js: env-file scan failed: ${err.message}`);
   }
 
+  try {
+    findings = findings.concat(scanInsecureRandomTokens(repoPath));
+  } catch (err) {
+    warnings.push(`secrets.js: insecure-random-token scan failed: ${err.message}`);
+  }
+
+  try {
+    findings = findings.concat(scanWeakPasswordHashing(repoPath));
+  } catch (err) {
+    warnings.push(`secrets.js: weak-password-hashing scan failed: ${err.message}`);
+  }
+
   return { findings, warnings };
 }
 
@@ -424,4 +597,6 @@ module.exports = {
   MULTILINE_PATTERNS,
   CHECK_HARDCODED,
   CHECK_ENV_COMMITTED,
+  CHECK_INSECURE_RANDOM_TOKEN,
+  CHECK_WEAK_PASSWORD_HASHING,
 };

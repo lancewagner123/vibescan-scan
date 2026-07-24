@@ -19,12 +19,13 @@
   SOC2 evidence, not a HIPAA risk assessment, not a PCI-DSS attestation, and should not
   be represented as any of those things to auditors, regulators, or customers.
 - **Coverage is strictly limited to the checks listed in `docs/CHECK_CATALOG.md`.**
-  There are exactly ten checks in v1. If a class of vulnerability isn't on that list,
-  VibeScan does not look for it — full stop.
+  There are exactly fifteen checks as of v0.2.0 (the original ten from v1, plus five more
+  added in v0.2.0). If a class of vulnerability isn't on that list, VibeScan does not look
+  for it — full stop.
 - **False negatives are possible and expected.** Pattern-based static checks miss things:
   obfuscated secrets, unusual code structure, novel frameworks, cleverly hidden logic.
-  A clean report means "we didn't find any of our ten known patterns," not "your app is
-  secure."
+  A clean report means "we didn't find any of our fifteen known patterns," not "your app
+  is secure."
 
 ## Who should not rely on this tool alone
 
@@ -52,12 +53,17 @@ guess, not a verification:
   behalf.** Every `fix.diff` is inert text in a report for a human to read, evaluate, and
   apply by hand (or reject). There is no "auto-fix" button and no planned version of
   this tool that merges code without a human in the loop.
-- **Findings tagged `authz` (missing-auth-middleware, supabase-rls-disabled), or the
-  `sql-string-concatenation` and `stripe-webhook-unverified` checks, deserve extra
-  scrutiny before you apply a suggested diff.** These are exactly the categories where an
-  incomplete fix is most likely to *look* successful while leaving a real hole open (or
-  breaking legitimate access) — get a second, human set of eyes on any diff in these
-  categories specifically, not just a glance.
+- **Findings tagged `authz` (missing-auth-middleware, supabase-rls-disabled), the
+  `sql-string-concatenation` and `stripe-webhook-unverified` checks, and (as of v0.2.0)
+  `mass-assignment` deserve extra scrutiny before you apply a suggested diff.** These are
+  exactly the categories where an incomplete fix is most likely to *look* successful while
+  leaving a real hole open (or breaking legitimate access) — get a second, human set of
+  eyes on any diff in these categories specifically, not just a glance. `mass-assignment`
+  is grouped with the authz checks here (even though its own `category` field is
+  `injection`, per `docs/FINDINGS_SCHEMA.md`) because the underlying risk is the same
+  shape: an attacker using the finding to set fields they were never meant to control
+  (`isAdmin`, `role`, `verified`, `balance`), which is privilege escalation in effect even
+  though the raw pattern being matched is "unallowlisted assignment," not an auth check.
 - If a future version of VibeScan adds automatic pull-request creation, that PR will be
   clearly labeled as an unreviewed, AI-generated suggestion requiring human security
   review before merge, and will not be opened automatically for high/critical
@@ -74,7 +80,10 @@ config values, and similar tricks. Each of those specific bypasses has since bee
 detected). But closing a *specific sample* is not the same as closing the *general
 technique* — every fix below is still a regex/text heuristic, not a real parser or a
 dataflow engine, and each one has a next-level evasion that would still get through.
-Documented here so the tool never silently implies more coverage than it has:
+Documented here so the tool never silently implies more coverage than it has. (Checks
+11-15, added in v0.2.0, were not part of this specific red-team pass — see their own
+limitations entries below instead, written at build time rather than found by a later
+adversarial audit.)
 
 - **Secrets (checks 1-3):** literal-splitting and base64 decoding are now caught, but
   only one level deep and only via `+` concatenation or single-pass base64. A secret
@@ -170,6 +179,47 @@ Documented here so the tool never silently implies more coverage than it has:
   `workspaces`/`pnpm-workspace.yaml`/`lerna.json` root config and issuing a single
   workspace-aware audit call, so a large monorepo with many packages will be slower than
   necessary (a real inefficiency, not a coverage gap).
+- **Insecure random token (check 11):** only recognizes `Math.random()` — a value built
+  from another weak-but-not-obviously-named source (a custom PRNG, `Date.now()` alone, a
+  poorly-seeded third-party library) is not detected. Name matching is a substring
+  heuristic (`token`/`session[_-]?id`/`api[_-]?key`/`secret`/`nonce`/`csrf`); a
+  security-sensitive value assigned to a name outside that list (e.g. `magicLink`,
+  `oneTimeCode`) is not flagged even though the same predictability risk applies. Only
+  JS/TS-family files are scanned — the same weak pattern in Python (`random.random()`),
+  Ruby, PHP, etc. is not covered.
+- **Weak password hashing (check 12):** only recognizes `crypto.createHash('md5'|'sha1')`
+  by name — a password hashed with a different fast/unsalted primitive (e.g. a single
+  round of `sha256` with no salt, or a non-Node crypto library in a polyglot codebase) is
+  not detected, since context/statement scoping is specific to this exact call shape. The
+  "does this look password-related" heuristic (a password-ish variable name in the same
+  statement, or an auth-looking file path) can both under- and over-fire: a password
+  variable named something this check doesn't recognize (e.g. `secret_phrase`) can evade
+  it, and a checksum helper that happens to hash a variable literally named `password` for
+  an unrelated reason could still be flagged.
+- **Mass assignment (check 13):** only recognizes the three call shapes explicitly listed
+  (`.create/update/save(req.body)`, `new Model(req.body)`, `Object.assign(existing,
+  req.body)`) and only resolves one same-file variable hop between `req.body`/`req.query`
+  and the call site. An ORM-specific bulk-write method this check doesn't know the name of
+  (e.g. a raw `.updateMany()`, a GraphQL resolver's input object, or a framework's own
+  "update from params" helper), a value passed through a second intermediate variable, or
+  `req.body` spread into an object literal (`{ ...req.body, id }`) instead of passed as a
+  whole argument, is not detected.
+- **Insecure cookie flags (check 14):** only inspects `res.cookie(...)` calls directly —
+  a cookie set via a different mechanism (a raw `Set-Cookie` header string, a
+  framework-specific session-cookie configuration object set once at app setup rather than
+  per-call, or a non-Express server framework's own cookie API) is not covered. The
+  sensitive-cookie judgment is a name/value substring heuristic
+  (`session`/`token`/`auth`/`jwt`/`secret`); a session cookie given an unrelated name
+  (e.g. `sid`, `uid`) can evade detection entirely.
+- **Open redirect (check 15):** only resolves a redirect target one same-file variable hop
+  from `req.query`/`req.body`/`req.params`, and only recognizes a narrow set of guard
+  patterns (`.startsWith('/')`, an `allowlist`/`whitelist`-named `.includes()` check, or a
+  bare `.includes()` call) as "this looks validated" — a real validation function with a
+  different name or shape (e.g. a same-file `isSafeRedirect(url)` helper, or validation
+  performed in a different file/middleware) is invisible to this heuristic and will still
+  be flagged as a false positive. Symmetrically, a redirect target built through two or
+  more variable hops, or arriving via a header (`Referer`) instead of
+  query/body/params, is not traced and will not be flagged (a false negative).
 - **Ancestor-repo scope bug — now guarded, not open (not part of the 10 checks):**
   `secret-git-history` and `secret-env-committed`'s git-history sub-scan both run git
   commands with `cwd` set to the scanned path. If that path is a subdirectory of a larger

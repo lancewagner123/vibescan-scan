@@ -1,9 +1,10 @@
 'use strict';
 
-// Checks 4-9 from docs/CHECK_CATALOG.md, via targeted regex/string-pattern heuristics
-// over .js/.ts/.jsx/.tsx source. These are intentionally precision-light — the
+// Checks 4-9 and 13-15 from docs/CHECK_CATALOG.md, via targeted regex/string-pattern
+// heuristics over .js/.ts/.jsx/.tsx source. These are intentionally precision-light — the
 // downstream LLM triage layer is responsible for filtering noise — but each pattern is
-// aimed at a real, specific signal rather than firing on every file.
+// aimed at a real, specific signal rather than firing on every file. (Checks 11-12 live in
+// secrets.js, not here.)
 
 const path = require('path');
 const { walkFiles, readTextFile, makeId, stripComments } = require('./util');
@@ -247,6 +248,40 @@ function extractBalancedCallArg(text, openParenIndex) {
     }
   }
   return null;
+}
+
+/**
+ * Split a call's argument-list text (the contents extracted by extractBalancedCallArg,
+ * i.e. everything between the outer parens) into its top-level comma-separated arguments.
+ * Tracks (), {}, [] nesting depth and quoted/template-literal string content so a comma
+ * *inside* a nested call/object/array/string (e.g. `Model.create({ a: 1, b: 2 }, opts)`'s
+ * first argument) isn't mistaken for an argument separator. Used by the mass-assignment
+ * and insecure-cookie-flags checks below, both of which need to reason about individual
+ * arguments of a call rather than the whole argument-list text at once.
+ * @param {string} argsText
+ * @returns {string[]}
+ */
+function splitTopLevelArgs(argsText) {
+  const parts = [];
+  let depth = 0;
+  let inString = null; // one of ' " ` while inside a string/template literal
+  let current = '';
+  for (let i = 0; i < argsText.length; i++) {
+    const ch = argsText[i];
+    if (inString) {
+      current += ch;
+      if (ch === '\\') { i++; current += argsText[i] || ''; continue; }
+      if (ch === inString) inString = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'" || ch === '`') { inString = ch; current += ch; continue; }
+    if (ch === '(' || ch === '{' || ch === '[') depth++;
+    if (ch === ')' || ch === '}' || ch === ']') depth--;
+    if (ch === ',' && depth === 0) { parts.push(current); current = ''; continue; }
+    current += ch;
+  }
+  if (current.trim() !== '') parts.push(current);
+  return parts;
 }
 
 // Looks up `function <name>(...) { ... }` in `clean` and returns the expression in its
@@ -717,6 +752,267 @@ function checkStripeWebhookUnverified(clean, filePath, original) {
   ];
 }
 
+// --- Check 13: mass-assignment ----------------------------------------------------------
+
+// Three call shapes, all sharing the same underlying bug: the ENTIRE req.body/req.query
+// object is handed to something that writes it onto a model/record, with no intermediate
+// destructuring/allowlist of individual fields in between. An attacker can then set any
+// field the model has -- isAdmin, role, verified, balance -- not just the ones the form
+// on the page intended to expose.
+//   Model.create(req.body)              -- method-call form (also covers .update/.save)
+//   new Model(req.body)                 -- constructor form
+//   Object.assign(existingRecord, req.body) -- merge-onto-existing-record form
+const MODEL_METHOD_CALL_RE = /\.(create|update|save)\s*\(/g;
+const NEW_MODEL_CALL_RE = /\bnew\s+[A-Za-z_$][\w.$]*\s*\(/g;
+const OBJECT_ASSIGN_CALL_RE = /\bObject\.assign\s*\(/g;
+
+// Confirms an individual (already top-level-split) call argument is the WHOLE req.body/
+// req.query object, not a specific field pulled off it (`req.body.name` doesn't match --
+// that's a single field, not mass assignment) and not something already destructured into
+// an allowlist. Resolves one variable hop, same "one-hop" precedent used by the CORS check
+// above: `const data = req.body; Model.create(data)` is exactly as dangerous as passing
+// req.body inline, just one assignment further away. Requires the ENTIRE declaration to be
+// `identifier = req.body;` (or req.query) with nothing else on the RHS -- a destructuring
+// assignment (`const { name, email } = req.body;`) has an object pattern on the LHS, not a
+// bare identifier, so it never matches this and is correctly treated as already-allowlisted.
+function argIsWholeReqBodyOrQuery(arg, clean) {
+  const trimmed = arg.trim();
+  if (/^req\.(?:body|query)$/.test(trimmed)) return true;
+  const identMatch = trimmed.match(/^[A-Za-z_$][\w$]*$/);
+  if (identMatch) {
+    const escaped = trimmed.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const declRe = new RegExp(`(?:const|let|var)\\s+${escaped}\\s*=\\s*(req\\.(?:body|query))\\s*;`);
+    if (declRe.test(clean)) return true;
+  }
+  return false;
+}
+
+function checkMassAssignment(clean, filePath, original) {
+  const hits = [];
+
+  MODEL_METHOD_CALL_RE.lastIndex = 0;
+  let m;
+  while ((m = MODEL_METHOD_CALL_RE.exec(clean)) !== null) {
+    const methodName = m[1];
+    const openParenIndex = m.index + m[0].length - 1;
+    const extracted = extractBalancedCallArg(clean, openParenIndex);
+    if (!extracted) continue;
+    const args = splitTopLevelArgs(extracted.arg);
+    if (args.some((a) => argIsWholeReqBodyOrQuery(a, clean))) {
+      hits.push({
+        line: lineOfIndex(original, m.index),
+        snippet: snippetAt(original, m.index),
+        rawMessage: `.${methodName}() is called with req.body/req.query passed through in its entirety, with no destructuring/allowlist of specific fields -- an attacker can set any field the model has (e.g. isAdmin, role, verified, balance), not just the ones the form intended.`,
+      });
+    }
+    MODEL_METHOD_CALL_RE.lastIndex = extracted.end;
+  }
+
+  NEW_MODEL_CALL_RE.lastIndex = 0;
+  while ((m = NEW_MODEL_CALL_RE.exec(clean)) !== null) {
+    const openParenIndex = m.index + m[0].length - 1;
+    const extracted = extractBalancedCallArg(clean, openParenIndex);
+    if (!extracted) continue;
+    const args = splitTopLevelArgs(extracted.arg);
+    if (args.some((a) => argIsWholeReqBodyOrQuery(a, clean))) {
+      hits.push({
+        line: lineOfIndex(original, m.index),
+        snippet: snippetAt(original, m.index),
+        rawMessage: 'new Model(req.body) constructs a model instance directly from the raw request body/query with no destructuring/allowlist -- an attacker can set any field the model has, including ones never meant to be user-settable.',
+      });
+    }
+    NEW_MODEL_CALL_RE.lastIndex = extracted.end;
+  }
+
+  OBJECT_ASSIGN_CALL_RE.lastIndex = 0;
+  while ((m = OBJECT_ASSIGN_CALL_RE.exec(clean)) !== null) {
+    const openParenIndex = m.index + m[0].length - 1;
+    const extracted = extractBalancedCallArg(clean, openParenIndex);
+    if (!extracted) continue;
+    const args = splitTopLevelArgs(extracted.arg);
+    if (args.length >= 2 && args.slice(1).some((a) => argIsWholeReqBodyOrQuery(a, clean))) {
+      hits.push({
+        line: lineOfIndex(original, m.index),
+        snippet: snippetAt(original, m.index),
+        rawMessage: 'Object.assign(existingRecord, req.body) merges the raw request body/query directly onto an existing record with no destructuring/allowlist -- an attacker can overwrite any field on that record, including ones never meant to be user-settable.',
+      });
+    }
+    OBJECT_ASSIGN_CALL_RE.lastIndex = extracted.end;
+  }
+
+  return hits;
+}
+
+// --- Check 14: insecure-cookie-flags -----------------------------------------------------
+
+// res.cookie(name, value[, options]) where the options object is either absent entirely,
+// or present but missing httpOnly:true/secure:true (or explicitly sets either to false),
+// for what looks like a session/auth cookie -- judged by the cookie's own name (e.g.
+// "sessionId", "authToken") or by the value expression looking security-sensitive (e.g.
+// assigning the result of something token/session/jwt-shaped). Architecturally similar to
+// the CORS check above: a config-shaped misconfiguration on a call whose options can be
+// inline or one variable hop away.
+const RES_COOKIE_CALL_RE = /\bres\.cookie\s*\(/g;
+const COOKIE_SENSITIVE_NAME_RE = /session|token|auth/i;
+const COOKIE_SENSITIVE_VALUE_RE = /session|token|jwt|auth|secret/i;
+const HTTP_ONLY_TRUE_RE = /\bhttpOnly\s*:\s*true\b/i;
+const SECURE_TRUE_RE = /\bsecure\s*:\s*true\b/i;
+
+// Resolves `optionsVar` back to its own object-literal declaration (`const opts = {
+// httpOnly: true, ... };`), the same one-variable-hop precedent used elsewhere in this
+// file, so `res.cookie('sid', id, cookieOpts)` can be checked just as well as an inline
+// options object. Returns null (rather than guessing) if the variable's declaration isn't
+// a plain object literal this file can see -- e.g. it's imported from another module, or
+// built conditionally -- so an unresolvable options variable is treated as "can't confirm"
+// and not flagged, matching this codebase's existing bail-rather-than-guess convention.
+function resolveObjectLiteralVar(clean, varName) {
+  const escaped = varName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const declRe = new RegExp(`(?:const|let|var)\\s+${escaped}\\s*=\\s*\\{`);
+  const m = declRe.exec(clean);
+  if (!m) return null;
+  const braceIndex = m.index + m[0].length - 1; // index of the declaration's opening '{'
+  return extractBalancedBraceBlock(clean, braceIndex);
+}
+
+function checkInsecureCookieFlags(clean, filePath, original) {
+  const hits = [];
+  RES_COOKIE_CALL_RE.lastIndex = 0;
+  let m;
+  while ((m = RES_COOKIE_CALL_RE.exec(clean)) !== null) {
+    const openParenIndex = m.index + m[0].length - 1;
+    const extracted = extractBalancedCallArg(clean, openParenIndex);
+    if (!extracted) { RES_COOKIE_CALL_RE.lastIndex = openParenIndex + 1; continue; }
+    const args = splitTopLevelArgs(extracted.arg);
+    RES_COOKIE_CALL_RE.lastIndex = extracted.end;
+    if (args.length < 2) continue; // need at least name + value to reason about this call
+
+    const nameArg = args[0].trim();
+    const valueArg = args[1].trim();
+    const looksSensitive = COOKIE_SENSITIVE_NAME_RE.test(nameArg) || COOKIE_SENSITIVE_VALUE_RE.test(valueArg);
+    if (!looksSensitive) continue;
+
+    let optionsText = null; // null means "no options object could be confirmed present"
+    if (args.length >= 3) {
+      const optionsArg = args[2].trim();
+      if (/^\{/.test(optionsArg)) {
+        optionsText = optionsArg;
+      } else if (/^[A-Za-z_$][\w$]*$/.test(optionsArg)) {
+        const resolved = resolveObjectLiteralVar(clean, optionsArg);
+        if (resolved === null) continue; // options passed via an unresolvable variable -- can't confirm, don't guess
+        optionsText = resolved;
+      }
+    }
+
+    if (optionsText === null) {
+      hits.push({
+        line: lineOfIndex(original, m.index),
+        snippet: snippetAt(original, m.index),
+        rawMessage: `res.cookie() sets what looks like a session/auth cookie ("${nameArg}") with no options object at all -- httpOnly and secure both default to unset, so the cookie is readable via XSS and can be sent over plain HTTP.`,
+      });
+      continue;
+    }
+
+    const missingHttpOnly = !HTTP_ONLY_TRUE_RE.test(optionsText);
+    const missingSecure = !SECURE_TRUE_RE.test(optionsText);
+    if (missingHttpOnly || missingSecure) {
+      const missing = [missingHttpOnly && 'httpOnly:true', missingSecure && 'secure:true'].filter(Boolean).join(' and ');
+      hits.push({
+        line: lineOfIndex(original, m.index),
+        snippet: snippetAt(original, m.index),
+        rawMessage: `res.cookie() sets what looks like a session/auth cookie ("${nameArg}") without ${missing} -- missing httpOnly allows theft via XSS, missing secure allows transmission over plain HTTP.`,
+      });
+    }
+  }
+  return hits;
+}
+
+// --- Check 15: open-redirect --------------------------------------------------------------
+
+// res.redirect([status,] target) called with a target that flows directly, or via one
+// same-file variable hop (same one-hop precedent as the CORS/mass-assignment checks
+// above), from req.query/req.body/req.params, with no allowlist/validation against a fixed
+// set of internal paths in sight. Lets an attacker craft a link on the trusted domain that
+// silently forwards a victim to an attacker-controlled site -- a common phishing vector.
+const RES_REDIRECT_CALL_RE = /\bres\.redirect\s*\(/g;
+const REQ_SOURCE_PROP_RE = /^req\.(?:query|body|params)(?:\.[\w$]+)?$/;
+
+// Resolves a bare identifier back to a same-file req.query/req.body/req.params origin, one
+// hop deep, in either of the two shapes real code actually uses:
+//   const url = req.query.redirect;              -- direct property/whole-object assignment
+//   const { redirect: url } = req.query;          -- destructured (with or without rename)
+// Returns the source expression string (e.g. "req.query.redirect") if resolved, else null.
+function resolveVarFromReqSource(clean, varName) {
+  const escaped = varName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const directRe = new RegExp(`(?:const|let|var)\\s+${escaped}\\s*=\\s*(req\\.(?:query|body|params)(?:\\.[\\w$]+)?)\\s*;`);
+  const dm = clean.match(directRe);
+  if (dm) return dm[1];
+  const destructureRe = new RegExp(
+    `(?:const|let|var)\\s*\\{[^}]*\\b(?:${escaped}|[\\w$]+\\s*:\\s*${escaped})\\b[^}]*\\}\\s*=\\s*(req\\.(?:query|body|params))\\s*;`,
+  );
+  const destM = clean.match(destructureRe);
+  return destM ? destM[1] : null;
+}
+
+// Best-effort "this looks validated" guard, checked in a window immediately before the
+// res.redirect() call, so an app that DOES check its redirect target isn't flagged just
+// because the check happens to live a few lines above the call rather than inline in it.
+// Deliberately loose (matches this file's existing "precision-light, downstream triage
+// filters noise" philosophy) -- a real allowlist function this heuristic doesn't recognize
+// will still slip through as a false positive, which the triage layer is expected to catch.
+const REDIRECT_VALIDATION_WINDOW_CHARS = 400;
+
+function hasNearbyRedirectValidation(clean, callIndex, varName) {
+  if (!varName) return false;
+  const windowStart = Math.max(0, callIndex - REDIRECT_VALIDATION_WINDOW_CHARS);
+  const window = clean.slice(windowStart, callIndex);
+  const escaped = varName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const patterns = [
+    new RegExp(`${escaped}\\s*\\.\\s*startsWith\\s*\\(`), // e.g. url.startsWith('/')
+    new RegExp(`(?:allow(?:list|ed)|whitelist)\\w*\\s*\\.\\s*includes\\s*\\(\\s*${escaped}\\b`, 'i'),
+    new RegExp(`${escaped}\\s*\\.\\s*includes\\s*\\(`), // weaker signal, still a plausible guard
+  ];
+  return patterns.some((re) => re.test(window));
+}
+
+function checkOpenRedirect(clean, filePath, original) {
+  const hits = [];
+  RES_REDIRECT_CALL_RE.lastIndex = 0;
+  let m;
+  while ((m = RES_REDIRECT_CALL_RE.exec(clean)) !== null) {
+    const openParenIndex = m.index + m[0].length - 1;
+    const extracted = extractBalancedCallArg(clean, openParenIndex);
+    if (!extracted) { RES_REDIRECT_CALL_RE.lastIndex = openParenIndex + 1; continue; }
+    RES_REDIRECT_CALL_RE.lastIndex = extracted.end;
+
+    const args = splitTopLevelArgs(extracted.arg);
+    if (args.length === 0) continue;
+    // Last argument is the actual redirect target in both res.redirect(url) and the
+    // two-arg res.redirect(statusCode, url) form.
+    const targetArg = args[args.length - 1].trim();
+
+    let sourceExpr = null;
+    let resolvedVarName = null;
+    if (REQ_SOURCE_PROP_RE.test(targetArg)) {
+      sourceExpr = targetArg;
+    } else if (/^[A-Za-z_$][\w$]*$/.test(targetArg)) {
+      const resolved = resolveVarFromReqSource(clean, targetArg);
+      if (resolved) {
+        sourceExpr = resolved;
+        resolvedVarName = targetArg;
+      }
+    }
+    if (!sourceExpr) continue;
+    if (hasNearbyRedirectValidation(clean, m.index, resolvedVarName || targetArg)) continue;
+
+    hits.push({
+      line: lineOfIndex(original, m.index),
+      snippet: snippetAt(original, m.index),
+      rawMessage: `res.redirect() target comes directly from ${sourceExpr}${resolvedVarName ? ` (via variable "${resolvedVarName}")` : ''} with no allowlist/validation against a fixed set of internal paths -- an attacker can craft a link on this trusted domain that silently forwards victims to an attacker-controlled site.`,
+    });
+  }
+  return hits;
+}
+
 // --- Wiring ----------------------------------------------------------------------------
 
 const CHECKS = [
@@ -726,6 +1022,9 @@ const CHECKS = [
   { checkId: 'missing-auth-middleware', severity: 'high', category: 'authz', run: checkMissingAuthMiddleware },
   { checkId: 'supabase-rls-disabled', severity: 'critical', category: 'authz', run: checkSupabaseRlsDisabled },
   { checkId: 'stripe-webhook-unverified', severity: 'high', category: 'crypto', run: checkStripeWebhookUnverified },
+  { checkId: 'mass-assignment', severity: 'high', category: 'injection', run: checkMassAssignment },
+  { checkId: 'insecure-cookie-flags', severity: 'high', category: 'config', run: checkInsecureCookieFlags },
+  { checkId: 'open-redirect', severity: 'medium', category: 'injection', run: checkOpenRedirect },
 ];
 
 function scan(repoPath, opts = {}) {
