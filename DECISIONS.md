@@ -169,3 +169,61 @@ package name collision, broken CI example, missing exit-code contract, `UNLICENS
 each read the source independently and cross-checked claims against `README.md`,
 `SECURITY_SCOPE.md`, `docs/CHECK_CATALOG.md`, `package.json`, `.github/workflows/vibescan.yml`,
 `bin/vibescan.js`, and `src/`.
+
+## Punch-list closure and re-verification
+
+**2026-07-24.** A fix pass addressed all 8 items above, followed by a skeptical-buyer
+adversarial redux, followed by this independent re-verification pass (re-running the actual
+commands one more time rather than trusting either prior pass's prose). Findings below are
+from commands run in *this* pass, not copied from the redux's report.
+
+**Final package identity:** name `vibescan-scan`, license `MIT` (`LICENSE` file present,
+copyright "Lance Wagner", 2026). `bin` field still installs the `vibescan` command via
+`npx vibescan-scan scan [path]`.
+
+### Status of the 7 fix-pass punch-list items (1-7 above; item 8 was out-of-scope-for-v1, not attempted)
+
+1. **Package identity — CLOSED.** `package.json` name/license confirmed as above.
+2. **CI workflow — CLOSED.** `.github/workflows/vibescan.yml` read directly: it now calls
+   `npx vibescan-scan@latest scan . --fail-on high`, real flags matching `bin/vibescan.js`,
+   headed explicitly as consumer-facing example documentation, not this repo's own CI.
+3. **`--fail-on` / exit code — CLOSED, re-verified live.** Ran
+   `node bin/vibescan.js scan test/fixtures/vulnerable-demo-app --fail-on critical` myself:
+   9 critical / 7 high findings, **exit code 1**. Ran the same flag against a freshly created
+   empty non-git temp directory: no issues found, **exit code 0**. Both directions hold.
+4. **License — CLOSED.** Verified above.
+5. **Git-history ancestor-scope guard — CLOSED, re-verified live.** Ran a scan against
+   `test/fixtures/evasion-attempts` (a subdirectory of this repo, not a repo root): got the
+   explicit "SKIPPED git-history secret scanning... scanned path is not its own git
+   repository root" warning for both the `secret-env-committed` and `secret-git-history`
+   sub-scans, surfaced up front in the terminal output, not buried in JSON. No misattributed
+   findings were produced.
+6. **Evasion/prompt-injection fixtures wired into `npm test` — CLOSED, re-verified live.** Ran
+   `npm test` myself: 13/13 tests pass, including one per `evasion-attempts` subfolder
+   (checks 1-10) and the `prompt-injection-variants` escaping test. Not a rubber stamp — this
+   is a real regression gate now.
+7. **`missing-auth-middleware` gaps (chained-route false negative, `router.use()` false
+   positive) — LOGIC CLOSED, but test coverage still OPEN.** Ran
+   `node bin/vibescan.js scan test/fixtures/regression-samples` myself: exactly 1 finding,
+   from `chained-route-no-auth.js` (the chained-route case correctly flagged); zero findings
+   from `router-use-guard-protected.js` (the guarded case correctly suppressed). The detection
+   logic is genuinely fixed. **But** `grep -rn "regression-samples" test/` returns nothing —
+   these two fixtures are not wired into `npm test` or CI, unlike the evasion/prompt-injection
+   fixtures in item 6. This is the same regression-coverage lesson item 6 already applied,
+   not yet applied to item 7's own fixtures. Concretely: a future refactor of
+   `checkMissingAuthMiddleware` could silently reopen either gap and nothing in `npm test`
+   would catch it. Low severity (doesn't break anything working today), but genuinely
+   unresolved — do not mark this item fully closed.
+
+### Overall ship verdict
+
+**Ship now, with one named caveat.** All four of the original "not ready" blockers (package
+identity, CI documentation, exit-code contract, license) are independently re-verified fixed.
+The evasion/prompt-injection regression-test gap the original panel flagged is also
+independently re-verified fixed. The one remaining open item is narrow and low-risk: wire
+`test/fixtures/regression-samples/{chained-route-no-auth.js,router-use-guard-protected.js}`
+into `npm test` the same way `evasion-attempts`/`prompt-injection-variants` were wired in
+(estimated 15 minutes of work) — until that lands, the `missing-auth-middleware` fixes for
+chained routes and `router.use()` guards are correct today but not regression-protected against
+a future refactor. This does not block using or publishing v1; it's a follow-up, not a
+blocker.
