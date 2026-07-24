@@ -410,6 +410,66 @@ function splitTopLevelArgs(argsText) {
   return parts;
 }
 
+// Extracts the expression following a `return` keyword inside `body` (a balanced brace
+// block's text -- a function/arrow-block body), tracking (), {}, [] depth and quoted-
+// string state instead of stopping at the first newline the way a naive
+// `return\s+([^;\n]+)` regex does. Needed for return statements whose expression itself
+// spans multiple lines inside balanced delimiters -- the classic hand-rolled
+// `generateUUID()` idiom (`return 'xxxx'.replace(/[xy]/g, function (c) { ... multi-line
+// body ... });`) has `Math.random()` several lines below the `return` keyword itself, so
+// the old single-line capture never saw it even though the whole statement is one
+// expression. Stops at the first top-level `;`, or at the enclosing block's own closing
+// brace if the return has no trailing semicolon. Returns null if no `return` is found.
+function extractReturnExpression(body) {
+  const m = /return\s+/.exec(body);
+  if (!m) return null;
+  const start = m.index + m[0].length;
+  let depth = 0;
+  let inString = null;
+  let i = start;
+  for (; i < body.length; i++) {
+    const ch = body[i];
+    if (inString) {
+      if (ch === '\\') { i++; continue; }
+      if (ch === inString) inString = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'" || ch === '`') { inString = ch; continue; }
+    if (ch === '(' || ch === '{' || ch === '[') { depth++; continue; }
+    if (ch === ')' || ch === '}' || ch === ']') {
+      if (depth === 0) break; // hit the enclosing block's own closing delimiter
+      depth--;
+      continue;
+    }
+    if (ch === ';' && depth === 0) break;
+  }
+  return body.slice(start, i).trim() || null;
+}
+
+// Looks up a same-file `class ClassName { static methodName(...) { ... return expr; ... }
+// }` static method and returns its return expression, or null if the class/method/return
+// can't be found. Regex-located, one level deep, same convention as
+// lookupFunctionReturnExpr's other shapes below -- added 2026-07-24 (round 2 evasion
+// audit) after a class-static-method call (`TokenGen.generate()`) was found to be
+// completely invisible to the bare-identifier-only helper-call resolution used elsewhere.
+function lookupStaticMethodReturnExpr(clean, className, methodName) {
+  const classEsc = className.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const methodEsc = methodName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const classRe = new RegExp(`class\\s+${classEsc}\\b[^{]*\\{`);
+  const classMatch = classRe.exec(clean);
+  if (!classMatch) return null;
+  const classBraceIndex = classMatch.index + classMatch[0].length - 1;
+  const classBody = extractBalancedBraceBlock(clean, classBraceIndex);
+  if (!classBody) return null;
+  const methodRe = new RegExp(`static\\s+${methodEsc}\\s*\\([^)]*\\)\\s*\\{`);
+  const methodMatch = methodRe.exec(classBody);
+  if (!methodMatch) return null;
+  const methodBraceIndex = methodMatch.index + methodMatch[0].length - 1;
+  const methodBody = extractBalancedBraceBlock(classBody, methodBraceIndex);
+  if (!methodBody) return null;
+  return extractReturnExpression(methodBody);
+}
+
 // Looks up a same-file helper named `calleeName` -- as a classic `function name(...) {}`
 // declaration OR an arrow function assigned to const/let/var (block body with an explicit
 // `return`, or a concise/expression body with an implicit return, e.g.
@@ -424,37 +484,54 @@ function splitTopLevelArgs(argsText) {
 // arrow function -- arrow functions are, if anything, more common than `function`
 // declarations in modern JS/TS (including AI-generated code), so this was a mainstream
 // style gap, not just a deeper adversarial evasion.
+//
+// Round-2 additions (2026-07-24, same day): `calleeName` may now be a dotted
+// `ClassName.methodName` (a static-method call site), dispatched to
+// lookupStaticMethodReturnExpr; the function-declaration regex now tolerates a
+// TypeScript return-type annotation between the params and the opening `{`
+// (`function name(): string {`); and both arrow-function regexes now tolerate a leading
+// `async` keyword before the params (`const name = async () => ...`).
 function lookupFunctionReturnExpr(clean, calleeName) {
+  const dotIndex = calleeName.indexOf('.');
+  if (dotIndex !== -1) {
+    return lookupStaticMethodReturnExpr(clean, calleeName.slice(0, dotIndex), calleeName.slice(dotIndex + 1));
+  }
+
   const escaped = calleeName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const paramsPattern = '(?:\\([^)]*\\)|[A-Za-z_$][\\w$]*)'; // (a, b) or a bare single param
 
   // Classic function declaration: function name(...) { ... return expr; ... }
-  const declRe = new RegExp(`function\\s+${escaped}\\s*\\([^)]*\\)\\s*\\{`);
+  // Optional `(?:\s*:\s*[^{]+)?` between the params and `{` tolerates a TypeScript
+  // return-type annotation (`function name(): string {`) -- ordinary, idiomatic
+  // TypeScript, not an adversarial trick.
+  const declRe = new RegExp(`function\\s+${escaped}\\s*\\([^)]*\\)\\s*(?::\\s*[^{]+)?\\{`);
   const declMatch = declRe.exec(clean);
   if (declMatch) {
     const braceIndex = declMatch.index + declMatch[0].length - 1;
     const body = extractBalancedBraceBlock(clean, braceIndex);
     if (body) {
-      const rm = body.match(/return\s+([^;\n]+)/);
-      if (rm) return rm[1].trim();
+      const expr = extractReturnExpression(body);
+      if (expr) return expr;
     }
   }
 
   // Arrow function, block body: const name = (...) => { ... return expr; ... }
-  const arrowBlockRe = new RegExp(`(?:const|let|var)\\s+${escaped}\\s*=\\s*${paramsPattern}\\s*=>\\s*\\{`);
+  // Optional `(?:async\s+)?` tolerates `const name = async (...) => { ... }`.
+  const arrowBlockRe = new RegExp(`(?:const|let|var)\\s+${escaped}\\s*=\\s*(?:async\\s+)?${paramsPattern}\\s*=>\\s*\\{`);
   const arrowBlockMatch = arrowBlockRe.exec(clean);
   if (arrowBlockMatch) {
     const braceIndex = arrowBlockMatch.index + arrowBlockMatch[0].length - 1;
     const body = extractBalancedBraceBlock(clean, braceIndex);
     if (body) {
-      const rm = body.match(/return\s+([^;\n]+)/);
-      if (rm) return rm[1].trim();
+      const expr = extractReturnExpression(body);
+      if (expr) return expr;
     }
   }
 
   // Arrow function, concise/expression body (implicit return, no braces):
   // const name = (...) => expr   or   const name = x => expr
-  const arrowExprRe = new RegExp(`(?:const|let|var)\\s+${escaped}\\s*=\\s*${paramsPattern}\\s*=>\\s*([^;\\n{][^;\\n]*)`);
+  // Optional `(?:async\s+)?` tolerates `const name = async (...) => expr`.
+  const arrowExprRe = new RegExp(`(?:const|let|var)\\s+${escaped}\\s*=\\s*(?:async\\s+)?${paramsPattern}\\s*=>\\s*([^;\\n{][^;\\n]*)`);
   const arrowExprMatch = arrowExprRe.exec(clean);
   if (arrowExprMatch) return arrowExprMatch[1].trim();
 
@@ -493,6 +570,31 @@ function resolveConcatExpression(clean, expr) {
       const dm = clean.match(declRe);
       if (!dm) return null;
       const subResolved = resolveConcatExpression(clean, dm[1]);
+      if (subResolved === null) return null;
+      resolved += subResolved;
+      continue;
+    }
+    // Static class field, accessed as a member expression: `HashConfig.ALGO`. Neither a
+    // plain literal nor a bare identifier (it contains a '.'), so the two branches above
+    // both reject it outright -- added 2026-07-24 (round 2 evasion audit) after a
+    // class-static-field config constant (a completely ordinary way to centralize a
+    // config value in modern JS/TS, not an adversarial trick) was found to defeat this
+    // resolver entirely.
+    const memberMatch = part.match(/^([A-Za-z_$][\w$]*)\.([A-Za-z_$][\w$]*)$/);
+    if (memberMatch) {
+      const [, className, fieldName] = memberMatch;
+      const classEsc = className.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const fieldEsc = fieldName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const classRe = new RegExp(`class\\s+${classEsc}\\b[^{]*\\{`);
+      const classMatch = classRe.exec(clean);
+      if (!classMatch) return null;
+      const classBraceIndex = classMatch.index + classMatch[0].length - 1;
+      const classBody = extractBalancedBraceBlock(clean, classBraceIndex);
+      if (!classBody) return null;
+      const fieldDeclRe = new RegExp(`static\\s+${fieldEsc}\\s*=\\s*([^;\\n]+)`);
+      const fieldMatch = classBody.match(fieldDeclRe);
+      if (!fieldMatch) return null;
+      const subResolved = resolveConcatExpression(clean, fieldMatch[1]);
       if (subResolved === null) return null;
       resolved += subResolved;
       continue;
