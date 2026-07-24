@@ -648,10 +648,18 @@ function checkStripeWebhookUnverified(clean, filePath, original) {
 // destructuring/allowlist of individual fields in between. An attacker can then set any
 // field the model has -- isAdmin, role, verified, balance -- not just the ones the form
 // on the page intended to expose.
-//   Model.create(req.body)              -- method-call form (also covers .update/.save)
+//   Model.create(req.body)              -- method-call form (also covers .update/.save
+//                                           and, as of 2026-07-24, Mongoose's other
+//                                           common single-call write methods below)
 //   new Model(req.body)                 -- constructor form
 //   Object.assign(existingRecord, req.body) -- merge-onto-existing-record form
-const MODEL_METHOD_CALL_RE = /\.(create|update|save)\s*\(/g;
+//
+// Method-name alternation extended 2026-07-24 (round 2, realistic-library-code audit):
+// was exactly `create|update|save`, which never matches Mongoose's `findByIdAndUpdate`/
+// `findOneAndUpdate` (arguably the single most common Mongoose write method for this
+// exact bug shape) or their delete/bulk siblings -- the arg-extraction logic below
+// already handles multi-arg calls fine once the callee name itself is recognized.
+const MODEL_METHOD_CALL_RE = /\.(create|update|save|findByIdAndUpdate|findOneAndUpdate|findByIdAndDelete|findOneAndDelete|findByIdAndRemove|updateOne|updateMany|bulkCreate)\s*\(/g;
 const NEW_MODEL_CALL_RE = /\bnew\s+[A-Za-z_$][\w.$]*\s*\(/g;
 const OBJECT_ASSIGN_CALL_RE = /\bObject\.assign\s*\(/g;
 
@@ -674,8 +682,41 @@ const OBJECT_ASSIGN_CALL_RE = /\bObject\.assign\s*\(/g;
 // object literal that spreads req.body/req.query *alongside other explicit keys*
 // (`{ ...req.body, id }`) is arguably a partial allowlist and deliberately left out of scope
 // here, same as the original red-team suggestion.
+// Was dot-notation only (`^req\.(?:body|query)$`) -- bracket/computed access
+// (`req['body']`) is semantically identical (the same whole, unfiltered object) but
+// didn't match at all. Fixed 2026-07-24 (round 2 evasion audit).
 function isReqBodyOrQueryExpr(text) {
-  return /^req\.(?:body|query)$/.test(text.trim());
+  return /^req(?:\.(?:body|query)|\[\s*['"](?:body|query)['"]\s*\])$/.test(text.trim());
+}
+
+// Resolves a bare identifier back to a same-file req.body/req.query origin via object
+// DESTRUCTURING (with or without renaming) straight off `req` itself:
+//   const { body } = req;              -- plain
+//   const { body: userData } = req;    -- renamed
+// resolveIdentifierChain (util.js) only recognizes a bare-identifier declaration LHS
+// (`name = req.body;`); a destructuring pattern on the LHS is a categorically different
+// shape it was never meant to handle, so this extremely common way of pulling req.body
+// out of req was invisible to argIsWholeReqBodyOrQuery entirely. Fixed 2026-07-24 (round
+// 2 evasion audit). Returns 'body'/'query' if resolved, else null.
+function resolveDestructuredReqSource(clean, varName) {
+  const escaped = varName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+  // Renamed form: const { body: userData } = req;  (varName === "userData")
+  const renamedRe = new RegExp(
+    `(?:const|let|var)\\s*\\{[^}]*\\b(body|query)\\s*:\\s*${escaped}\\b[^}]*\\}\\s*=\\s*req\\b`,
+  );
+  const renamedMatch = renamedRe.exec(clean);
+  if (renamedMatch) return renamedMatch[1];
+
+  // Plain form: const { body } = req;  (varName IS the source property name itself)
+  // `(?!\s*:)` excludes matching "body"/"query" when it's actually the SOURCE key of a
+  // renamed destructure elsewhere in the pattern (already handled by renamedRe above).
+  if (varName === 'body' || varName === 'query') {
+    const plainRe = new RegExp(`(?:const|let|var)\\s*\\{[^}]*\\b${escaped}\\b(?!\\s*:)[^}]*\\}\\s*=\\s*req\\b`);
+    if (plainRe.test(clean)) return varName;
+  }
+
+  return null;
 }
 
 function argIsWholeReqBodyOrQuery(arg, clean) {
@@ -693,10 +734,23 @@ function argIsWholeReqBodyOrQuery(arg, clean) {
     return false;
   }
 
+  // Prisma's entire write-call shape nests the actual payload one level down under a
+  // `data:` key (`prisma.user.create({ data: req.body })` / `{ where, data: req.body }`)
+  // instead of passing req.body as the top-level argument -- Prisma is one of the three
+  // ORMs this check explicitly targets (per its own doc comment), but this shape was
+  // completely unreachable before. Fixed 2026-07-24 (round 2, realistic-library-code
+  // audit). Matches a `data:` key anywhere in the object literal, independent of other
+  // keys (`where`, `select`, ...) present alongside it.
+  if (/^\{/.test(trimmed)) {
+    const dataMatch = trimmed.match(/\bdata\s*:\s*([^,}]+)/);
+    if (dataMatch && argIsWholeReqBodyOrQuery(dataMatch[1].trim(), clean)) return true;
+  }
+
   const identMatch = trimmed.match(/^[A-Za-z_$][\w$]*$/);
   if (identMatch) {
     const resolved = resolveIdentifierChain(clean, trimmed);
     if (resolved && isReqBodyOrQueryExpr(resolved)) return true;
+    if (resolveDestructuredReqSource(clean, trimmed)) return true;
   }
   return false;
 }
@@ -767,10 +821,29 @@ function checkMassAssignment(clean, filePath, original) {
 // the CORS check above: a config-shaped misconfiguration on a call whose options can be
 // inline or one variable hop away.
 const RES_COOKIE_CALL_RE = /\bres\.cookie\s*\(/g;
-const COOKIE_SENSITIVE_NAME_RE = /session|token|auth/i;
-const COOKIE_SENSITIVE_VALUE_RE = /session|token|jwt|auth|secret/i;
+// "auth"'s bare-substring match collides with "author" -- a false-positive audit (round
+// 2, 2026-07-24) found a blog "author theme preference" cookie flagged purely because
+// "auth" is a literal substring of "author". A blanket word-boundary fix would also break
+// legitimate "authenticate"/"authorize"/"authentication" names (there's no real
+// word-boundary between "auth" and those suffixes either -- camelCase compounds are one
+// continuous run of letters, same as "author"), so this targets the SPECIFIC collision
+// instead: "auth" immediately followed by "or" and then a segment-ending character (a
+// capital letter/non-letter/end-of-string) is excluded -- matching "author"/
+// "authorTheme"/"author_id" but NOT "authorize"/"authorization"/"authority" (all continue
+// with a lowercase letter after "or", which this negative lookahead deliberately still
+// lets through as auth-related). Fixed 2026-07-24 (round 2 evasion audit).
+const COOKIE_AUTH_KEYWORD_SRC = 'auth(?!or(?:[A-Z]|[^a-zA-Z]|$))';
+const COOKIE_SENSITIVE_NAME_RE = new RegExp(`session|token|${COOKIE_AUTH_KEYWORD_SRC}`, 'i');
+const COOKIE_SENSITIVE_VALUE_RE = new RegExp(`session|token|jwt|secret|${COOKIE_AUTH_KEYWORD_SRC}`, 'i');
 const HTTP_ONLY_TRUE_RE = /\bhttpOnly\s*:\s*true\b/i;
 const SECURE_TRUE_RE = /\bsecure\s*:\s*true\b/i;
+// A false-positive audit (round 2, 2026-07-24) found `secure: process.env.NODE_ENV ===
+// 'production'` -- a near-universal, textbook-correct Express idiom (secure in
+// production/HTTPS, not secure in local dev/plain HTTP, where a literal `secure:true`
+// would silently break cookies) -- flagged as "missing secure:true" purely because
+// SECURE_TRUE_RE only recognizes the literal boolean. Recognized here as an equally
+// satisfying signal for the secure flag, alongside the literal.
+const SECURE_ENV_CONDITIONAL_RE = /\bsecure\s*:\s*[^,}]*NODE_ENV[^,}]*production/i;
 
 // Resolves `optionsVar` back to its own object-literal declaration (`const opts = {
 // httpOnly: true, ... };`), so `res.cookie('sid', id, cookieOpts)` can be checked just as
@@ -785,6 +858,17 @@ const SECURE_TRUE_RE = /\bsecure\s*:\s*true\b/i;
 // conditionally, or the helper function's return isn't a plain object literal -- so an
 // unresolvable options variable is treated as "can't confirm" and not flagged, matching
 // this codebase's existing bail-rather-than-guess convention.
+// Strips one layer of wrapping parens (`(EXPR)` -> `EXPR`), if present. An arrow
+// function's concise/implicit-return body MUST wrap a returned object literal in parens
+// (`() => ({ ... })`) -- otherwise the `{` parses as a block body, not an object literal
+// -- so lookupFunctionReturnExpr correctly returns the text WITH its wrapping parens
+// intact, and callers that only test `/^\{/` need this to see through them.
+function stripWrappingParens(text) {
+  const t = text.trim();
+  if (t[0] === '(' && t[t.length - 1] === ')') return t.slice(1, -1).trim();
+  return t;
+}
+
 function resolveObjectLiteralVar(clean, varName) {
   const escaped = varName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
@@ -799,10 +883,37 @@ function resolveObjectLiteralVar(clean, varName) {
   const cm = callDeclRe.exec(clean);
   if (cm) {
     const returnExpr = lookupFunctionReturnExpr(clean, cm[1]);
-    if (returnExpr && /^\{/.test(returnExpr.trim())) return returnExpr.trim();
+    // Was `/^\{/.test(returnExpr.trim())` -- rejected an arrow helper with a concise
+    // implicit-return object literal (`const buildCookieOptions = () => ({ ... });`,
+    // the standard, idiomatic way every JS dev/linter writes this) because its returned
+    // text starts with '(' (the required wrapping parens), not '{'. Fixed 2026-07-24
+    // (round 2 evasion audit): strip a wrapping paren layer before the shape test.
+    if (returnExpr) {
+      const stripped = stripWrappingParens(returnExpr);
+      if (/^\{/.test(stripped)) return stripped;
+    }
   }
 
   return null;
+}
+
+// Resolves an INLINE call expression used directly as the options argument (e.g.
+// `res.cookie('sid', t, buildSecureCookieOptions())`) by looking up the callee's own
+// `return` expression, the same way resolveObjectLiteralVar resolves a call stored in a
+// variable first. Returns the object-literal text if resolved, else null. Added
+// 2026-07-24 (round 2 evasion audit) to close a false-positive: previously an inline call
+// expression matched neither the `/^\{/` (inline literal) nor bare-identifier (resolved
+// via resolveObjectLiteralVar) branches, so `optionsText` stayed null for ANY unrecognized
+// shape -- including a perfectly secure inline call -- and the code unconditionally
+// reported "no options object at all", which is factually false when an options argument
+// IS present, just not in a shape this check used to look inside.
+function resolveInlineCallOptionsArg(clean, optionsArg) {
+  const callMatch = optionsArg.match(/^([A-Za-z_$][\w$]*)\s*\(([^()]*)\)$/);
+  if (!callMatch) return null;
+  const returnExpr = lookupFunctionReturnExpr(clean, callMatch[1]);
+  if (!returnExpr) return null;
+  const stripped = stripWrappingParens(returnExpr);
+  return /^\{/.test(stripped) ? stripped : null;
 }
 
 function checkInsecureCookieFlags(clean, filePath, original) {
@@ -822,19 +933,36 @@ function checkInsecureCookieFlags(clean, filePath, original) {
     const looksSensitive = COOKIE_SENSITIVE_NAME_RE.test(nameArg) || COOKIE_SENSITIVE_VALUE_RE.test(valueArg);
     if (!looksSensitive) continue;
 
-    let optionsText = null; // null means "no options object could be confirmed present"
-    if (args.length >= 3) {
+    // optionsText: the resolved options-object text, once confirmed. null throughout
+    // this block is ambiguous on purpose ("not yet resolved") -- optionsArgPresent and
+    // optionsUnresolvable disambiguate "there really is no 3rd argument at all" (a real
+    // "missing options object entirely" finding) from "there IS a 3rd argument but this
+    // check can't confirm its contents" (bail, don't guess -- fixed 2026-07-24, round 2
+    // evasion audit: the old code conflated these two and reported "no options object at
+    // all" for a securely-configured inline call expression it simply never looked
+    // inside, which is a false positive, not a confirmed finding).
+    let optionsText = null;
+    const optionsArgPresent = args.length >= 3;
+    let optionsUnresolvable = false;
+
+    if (optionsArgPresent) {
       const optionsArg = args[2].trim();
       if (/^\{/.test(optionsArg)) {
         optionsText = optionsArg;
       } else if (/^[A-Za-z_$][\w$]*$/.test(optionsArg)) {
         const resolved = resolveObjectLiteralVar(clean, optionsArg);
-        if (resolved === null) continue; // options passed via an unresolvable variable -- can't confirm, don't guess
-        optionsText = resolved;
+        if (resolved === null) optionsUnresolvable = true; // unresolvable variable -- can't confirm, don't guess
+        else optionsText = resolved;
+      } else {
+        const resolved = resolveInlineCallOptionsArg(clean, optionsArg);
+        if (resolved === null) optionsUnresolvable = true; // some other unrecognized shape -- can't confirm, don't guess
+        else optionsText = resolved;
       }
     }
 
-    if (optionsText === null) {
+    if (optionsArgPresent && optionsUnresolvable) continue;
+
+    if (!optionsArgPresent) {
       hits.push({
         line: lineOfIndex(original, m.index),
         snippet: snippetAt(original, m.index),
@@ -844,7 +972,7 @@ function checkInsecureCookieFlags(clean, filePath, original) {
     }
 
     const missingHttpOnly = !HTTP_ONLY_TRUE_RE.test(optionsText);
-    const missingSecure = !SECURE_TRUE_RE.test(optionsText);
+    const missingSecure = !SECURE_TRUE_RE.test(optionsText) && !SECURE_ENV_CONDITIONAL_RE.test(optionsText);
     if (missingHttpOnly || missingSecure) {
       const missing = [missingHttpOnly && 'httpOnly:true', missingSecure && 'secure:true'].filter(Boolean).join(' and ');
       hits.push({
@@ -865,7 +993,13 @@ function checkInsecureCookieFlags(clean, filePath, original) {
 // set of internal paths in sight. Lets an attacker craft a link on the trusted domain that
 // silently forwards a victim to an attacker-controlled site -- a common phishing vector.
 const RES_REDIRECT_CALL_RE = /\bres\.redirect\s*\(/g;
-const REQ_SOURCE_PROP_RE = /^req\.(?:query|body|params)(?:\.[\w$]+)?$/;
+// Optional `(?:\?\.[\w$]+)?` (was `(?:\.[\w$]+)?`, dot-only) and the trailing
+// `(?:\s*\?\?\s*.+)?$` allowance added 2026-07-24 (round 2 evasion audit): optional
+// chaining + a nullish-coalescing fallback (`req.query?.next ?? '/home'`) is exactly as
+// attacker-influenced as `req.query.next` -- an attacker who omits the query param just
+// gets the default; one who supplies it gets forwarded to it -- but the extra `?.`/`??`
+// punctuation defeated the old exact-match regex entirely.
+const REQ_SOURCE_PROP_RE = /^req\.(?:query|body|params)(?:\??\.[\w$]+)?(?:\s*\?\?\s*.+)?$/;
 // Looser than REQ_SOURCE_PROP_RE: matches a req.query/body/params reference ANYWHERE in an
 // arbitrary expression, not just as the expression's entire text -- needed for the
 // function-return-expression case just below, where the resolved expression is often a
@@ -873,11 +1007,29 @@ const REQ_SOURCE_PROP_RE = /^req\.(?:query|body|params)(?:\.[\w$]+)?$/;
 // property access.
 const REQ_SOURCE_PROP_ANYWHERE_RE = /\breq\.(?:query|body|params)\b/;
 
+// Normalizes a res.redirect() target argument's raw text before any of the resolution
+// branches below see it -- two round-2 evasion-audit findings (2026-07-24) turned out to
+// be pure TEXT-shape dodges that vanish once undone, rather than needing their own
+// resolution branch:
+//   - a leading `await` (`await getRedirectTarget(req)` passed directly as the argument,
+//     not first assigned to a variable) breaks the call-expression regex's anchor;
+//   - a single-interpolation template literal (`` `${req.query.next}` ``) is a runtime
+//     no-op (String(x) === `${x}` for a normal string) but is textually neither an exact
+//     req.* match, a bare identifier, nor a call expression.
+function normalizeRedirectTarget(text) {
+  let t = text.trim();
+  t = t.replace(/^await\s+/, '');
+  const templateMatch = t.match(/^`\$\{([\s\S]*)\}`$/);
+  if (templateMatch) t = templateMatch[1].trim();
+  return t;
+}
+
 // Resolves a bare identifier back to a same-file req.query/req.body/req.params origin, in
-// either of the two shapes real code actually uses:
+// any of the shapes real code actually uses:
 //   const url = req.query.redirect;              -- direct property/whole-object assignment
 //     (any number of further `const x = y;` variable hops away, via resolveIdentifierChain)
 //   const { redirect: url } = req.query;          -- destructured (with or without rename)
+//   const { query: { redirect: url } } = req;     -- NESTED destructuring straight off req
 // Returns the source expression string (e.g. "req.query.redirect") if resolved, else null.
 function resolveVarFromReqSource(clean, varName) {
   const resolved = resolveIdentifierChain(clean, varName);
@@ -888,23 +1040,67 @@ function resolveVarFromReqSource(clean, varName) {
     `(?:const|let|var)\\s*\\{[^}]*\\b(?:${escaped}|[\\w$]+\\s*:\\s*${escaped})\\b[^}]*\\}\\s*=\\s*(req\\.(?:query|body|params))\\s*;`,
   );
   const destM = clean.match(destructureRe);
-  return destM ? destM[1] : null;
+  if (destM) return destM[1];
+
+  // Nested destructuring straight off `req` itself: const { query: { next } } = req;
+  // -- the source property (query/body/params) lives as an outer key in the pattern, the
+  // bound name is nested one level deeper, and the RHS is bare `req`, not
+  // req.query/body/params -- a shape the flat destructureRe above (which requires the RHS
+  // to be exactly one of those three) can't span. Added 2026-07-24 (round 2 evasion audit).
+  const nestedDestructureRe = new RegExp(
+    `(?:const|let|var)\\s*\\{\\s*(query|body|params)\\s*:\\s*\\{[^{}]*\\b${escaped}\\b[^{}]*\\}\\s*\\}\\s*=\\s*req\\b`,
+  );
+  const nestedM = clean.match(nestedDestructureRe);
+  if (nestedM) return `req.${nestedM[1]}.${varName}`;
+
+  return null;
 }
 
-// Resolves a call expression (e.g. `getRedirectTarget(req)`) back to a same-file function's
-// return expression (lookupFunctionReturnExpr, shared with checks 11-12/14 via util.js)
-// and checks whether THAT expression references req.query/body/params anywhere -- closes
-// the "route the tainted value through a same-file helper function" gap, the same "one hop
-// isn't enough" shape as the mass-assignment and insecure-cookie-flags checks. Deliberately
-// loose (REQ_SOURCE_PROP_ANYWHERE_RE, not the anchored REQ_SOURCE_PROP_RE) since a helper's
-// return is often a short-circuit chain (`req.query.next || req.query.returnTo`), not a
-// single bare property access. Returns the resolved return-expression text if it looks
-// req-sourced, else null.
+// Resolves a call expression (e.g. `getRedirectTarget(req)`, or `await
+// getRedirectTarget(req)` -- a leading await is stripped defensively here too, though
+// normalizeRedirectTarget above already handles it for the primary call site) back to a
+// same-file function's return expression (lookupFunctionReturnExpr, shared with checks
+// 11-12/14 via util.js) and checks whether THAT expression references req.query/body/
+// params anywhere -- closes the "route the tainted value through a same-file helper
+// function" gap, the same "one hop isn't enough" shape as the mass-assignment and
+// insecure-cookie-flags checks. Deliberately loose (REQ_SOURCE_PROP_ANYWHERE_RE, not the
+// anchored REQ_SOURCE_PROP_RE) since a helper's return is often a short-circuit chain
+// (`req.query.next || req.query.returnTo`), not a single bare property access. Returns
+// the resolved return-expression text if it looks req-sourced, else null.
 function resolveCallExprFromReqSource(clean, targetArg) {
-  const callMatch = targetArg.match(/^([A-Za-z_$][\w$]*)\s*\(([^()]*)\)$/);
+  const stripped = targetArg.trim().replace(/^await\s+/, '');
+  const callMatch = stripped.match(/^([A-Za-z_$][\w$]*)\s*\(([^()]*)\)$/);
   if (!callMatch) return null;
   const returnExpr = lookupFunctionReturnExpr(clean, callMatch[1]);
   if (returnExpr && REQ_SOURCE_PROP_ANYWHERE_RE.test(returnExpr)) return returnExpr.trim();
+  return null;
+}
+
+// Resolves a `new URL(<reqSourceExpr>, <base>)` redirect target -- a known, well-known
+// "looks safe, isn't" bypass idiom: `new URL(untrustedInput, base)` is often added as if
+// it were a validation guard, but if the first argument is an absolute URL, the WHATWG URL
+// parser ignores the base entirely and resolves to the attacker's URL. Since developers who
+// write this pattern often BELIEVE they've fixed the open-redirect, it's worth its own
+// explicit recognition rather than being just another missed call shape. Added 2026-07-24
+// (round 2, realistic-library-code audit). Returns the resolved req-source expression
+// (e.g. "req.query.next") if the URL constructor's first argument traces back to one,
+// else null.
+const NEW_URL_CALL_RE = /new\s+URL\s*\(/;
+
+function resolveNewUrlFromReqSource(clean, targetArg) {
+  const idx = targetArg.search(NEW_URL_CALL_RE);
+  if (idx === -1) return null;
+  const openParenIdx = targetArg.indexOf('(', idx);
+  const extracted = extractBalancedCallArg(targetArg, openParenIdx);
+  if (!extracted) return null;
+  const urlArgs = splitTopLevelArgs(extracted.arg);
+  if (urlArgs.length === 0) return null;
+  const firstArg = urlArgs[0].trim();
+  if (REQ_SOURCE_PROP_RE.test(firstArg)) return firstArg;
+  if (/^[A-Za-z_$][\w$]*$/.test(firstArg)) {
+    const resolved = resolveVarFromReqSource(clean, firstArg);
+    if (resolved) return resolved;
+  }
   return null;
 }
 
@@ -923,8 +1119,22 @@ function hasNearbyRedirectValidation(clean, callIndex, varName) {
   const escaped = varName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const patterns = [
     new RegExp(`${escaped}\\s*\\.\\s*startsWith\\s*\\(`), // e.g. url.startsWith('/')
-    new RegExp(`(?:allow(?:list|ed)|whitelist)\\w*\\s*\\.\\s*includes\\s*\\(\\s*${escaped}\\b`, 'i'),
+    // Was `(?:allow(?:list|ed)|whitelist)\w*\.includes(VAR)` -- required the array's own
+    // name to start with an allow/whitelist-ish prefix. A false-positive audit (round 2,
+    // 2026-07-24) found an equally-safe allowlist check named "internalPaths" (or any
+    // other reasonable name) went unrecognized purely because of that naming requirement.
+    // Dropped: any `ARRAY.includes(VAR)` shape is treated as a plausible guard regardless
+    // of the array's name -- the risk of over-broadening is low since this only
+    // *suppresses* a finding, it never creates one.
+    new RegExp(`[A-Za-z_$][\\w$]*\\s*\\.\\s*includes\\s*\\(\\s*${escaped}\\b`),
     new RegExp(`${escaped}\\s*\\.\\s*includes\\s*\\(`), // weaker signal, still a plausible guard
+    // `new URL(target, base)` followed by an `.origin` comparison -- a standard, robust
+    // open-redirect guard (resolve against the site's own origin, reject anything that
+    // resolves elsewhere) that a false-positive audit (round 2, 2026-07-24) found wasn't
+    // recognized at all. Deliberately loose: just requires a same-window `.origin`
+    // comparison after constructing a URL from the target, not a specific comparison
+    // target -- this is a suppression-only heuristic, same tradeoff as above.
+    new RegExp(`new\\s+URL\\s*\\(\\s*${escaped}\\b[\\s\\S]*?\\.origin\\s*(?:!==|===)`),
   ];
   return patterns.some((re) => re.test(window));
 }
@@ -942,11 +1152,14 @@ function checkOpenRedirect(clean, filePath, original) {
     const args = splitTopLevelArgs(extracted.arg);
     if (args.length === 0) continue;
     // Last argument is the actual redirect target in both res.redirect(url) and the
-    // two-arg res.redirect(statusCode, url) form.
-    const targetArg = args[args.length - 1].trim();
+    // two-arg res.redirect(statusCode, url) form. Normalized (leading `await` stripped, a
+    // single-interpolation template-literal wrapper unwrapped) before any resolution
+    // branch sees it -- see normalizeRedirectTarget's own doc comment.
+    const targetArg = normalizeRedirectTarget(args[args.length - 1]);
 
     let sourceExpr = null;
     let resolvedVarName = null;
+    let viaNewUrl = false;
     if (REQ_SOURCE_PROP_RE.test(targetArg)) {
       sourceExpr = targetArg;
     } else if (/^[A-Za-z_$][\w$]*$/.test(targetArg)) {
@@ -957,15 +1170,36 @@ function checkOpenRedirect(clean, filePath, original) {
       }
     } else {
       const resolved = resolveCallExprFromReqSource(clean, targetArg);
-      if (resolved) sourceExpr = resolved;
+      if (resolved) {
+        sourceExpr = resolved;
+      } else {
+        const urlResolved = resolveNewUrlFromReqSource(clean, targetArg);
+        if (urlResolved) {
+          sourceExpr = urlResolved;
+          viaNewUrl = true;
+        }
+      }
     }
+
+    // Fallback: the expression clearly references req.query/body/params somewhere but
+    // isn't one of the specific recognized shapes above -- still attacker-influenced.
+    // Same "precision-light, downstream triage filters noise" philosophy as the rest of
+    // this file.
+    if (!sourceExpr && REQ_SOURCE_PROP_ANYWHERE_RE.test(targetArg)) {
+      sourceExpr = targetArg;
+    }
+
     if (!sourceExpr) continue;
     if (hasNearbyRedirectValidation(clean, m.index, resolvedVarName || targetArg)) continue;
+
+    const newUrlNote = viaNewUrl
+      ? ' (wrapped in `new URL(..., base).toString()` -- if this value can be an absolute URL, the base argument is ignored entirely by the WHATWG URL parser and the redirect still goes wherever the attacker points it, so this is NOT actually a validation guard despite looking like one)'
+      : '';
 
     hits.push({
       line: lineOfIndex(original, m.index),
       snippet: snippetAt(original, m.index),
-      rawMessage: `res.redirect() target comes directly from ${sourceExpr}${resolvedVarName ? ` (via variable "${resolvedVarName}")` : ''} with no allowlist/validation against a fixed set of internal paths -- an attacker can craft a link on this trusted domain that silently forwards victims to an attacker-controlled site.`,
+      rawMessage: `res.redirect() target comes directly from ${sourceExpr}${resolvedVarName ? ` (via variable "${resolvedVarName}")` : ''}${newUrlNote} with no allowlist/validation against a fixed set of internal paths -- an attacker can craft a link on this trusted domain that silently forwards victims to an attacker-controlled site.`,
     });
   }
   return hits;
