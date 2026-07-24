@@ -125,6 +125,119 @@ test('evasion-attempts/16-mainstream-style-variants/no-semicolons-hash.js: weak-
   );
 });
 
+// Round 2 evasion/false-positive audit (2026-07-24) -- a deeper adversarial pass against
+// checks 11-15 specifically, run after the checks had already survived one hardening
+// round. 14 new evasion (false-negative) gaps and 2 new false-positive gaps were found and
+// fixed the same day (see SECURITY_SCOPE.md's per-check entries for what changed and why).
+// One folder, many individually-named files -- same "per-file test, not a single
+// EVASION_CASES tuple" pattern as 16-mainstream-style-variants above, since several
+// distinct new gaps map to the same checkId within this one folder.
+const ROUND2_EVASIONS_ROOT = path.join(EVASION_FIXTURES_ROOT, '17-round2-new-evasions');
+let round2Findings;
+
+async function round2FindingsFor() {
+  round2Findings = round2Findings || (await scanRepo(ROUND2_EVASIONS_ROOT));
+  return round2Findings;
+}
+
+const ROUND2_EVASION_CASES = [
+  ['11-bracket-key-template-literal.js', 'insecure-random-token', 'a bracket-notation property key written as a template literal'],
+  ['11-class-static-method-indirection.js', 'insecure-random-token', 'Math.random() reached via a static-class-method call (TokenGen.generate())'],
+  ['11-async-arrow-helper.js', 'insecure-random-token', 'Math.random() reached via an async arrow-function helper'],
+  ['11-typescript-return-type-annotation.ts', 'insecure-random-token', 'Math.random() reached via a function with a TypeScript return-type annotation'],
+  ['12-computed-member-createhash.js', 'weak-password-hashing', 'crypto[\'createHash\'](...) computed-member call'],
+  ['12-class-static-field-algo.js', 'weak-password-hashing', 'the hash algorithm resolved via a class static field (HashConfig.ALGO)'],
+  ['13-bracket-req-body.js', 'mass-assignment', 'req[\'body\'] bracket/computed access'],
+  ['13-destructured-body.js', 'mass-assignment', 'plain destructuring (const { body } = req;)'],
+  ['13-destructured-renamed-body.js', 'mass-assignment', 'renamed destructuring (const { body: userData } = req;)'],
+  ['14-arrow-paren-object-literal.js', 'insecure-cookie-flags', 'an arrow helper with a paren-wrapped implicit-return object literal'],
+  ['15-optional-chaining-nullish.js', 'open-redirect', 'optional chaining + nullish coalescing (req.query?.next ?? \'/home\')'],
+  ['15-template-literal-target.js', 'open-redirect', 'a template-literal-wrapped redirect target'],
+  ['15-nested-destructuring.js', 'open-redirect', 'nested destructuring straight off req (const { query: { next } } = req;)'],
+  ['15-awaited-helper-call.js', 'open-redirect', 'an awaited helper call passed inline (res.redirect(await getRedirectTarget(req)))'],
+];
+
+for (const [filename, expectedCheckId, description] of ROUND2_EVASION_CASES) {
+  test(`evasion-attempts/17-round2-new-evasions/${filename}: ${expectedCheckId} still caught (${description})`, async () => {
+    const findings = await round2FindingsFor();
+    const hits = findings.filter((f) => f.checkId === expectedCheckId && f.file.includes(filename));
+    assert.ok(
+      hits.length >= 1,
+      `expected ${expectedCheckId} to fire on ${filename} (${description}) -- a round-2 evasion fix may have regressed`
+    );
+  });
+}
+
+test('evasion-attempts/17-round2-new-evasions/14-false-positive-conditional-secure.js: insecure-cookie-flags does NOT fire on secure:NODE_ENV-conditional cookies', async () => {
+  const findings = await round2FindingsFor();
+  const hits = findings.filter(
+    (f) => f.checkId === 'insecure-cookie-flags' && f.file.includes('14-false-positive-conditional-secure.js')
+  );
+  assert.equal(hits.length, 0, `expected zero insecure-cookie-flags findings -- the NODE_ENV-conditional secure fix may have regressed. Found: ${JSON.stringify(hits)}`);
+});
+
+test('evasion-attempts/17-round2-new-evasions/14-false-positive-inline-call-options.js: insecure-cookie-flags does NOT fire on a securely-configured inline call expression', async () => {
+  const findings = await round2FindingsFor();
+  const hits = findings.filter(
+    (f) => f.checkId === 'insecure-cookie-flags' && f.file.includes('14-false-positive-inline-call-options.js')
+  );
+  assert.equal(hits.length, 0, `expected zero insecure-cookie-flags findings -- the inline-call-expression options resolution fix may have regressed. Found: ${JSON.stringify(hits)}`);
+});
+
+test('evasion-attempts/17-round2-new-evasions/all-checks-interaction.js: all 10 independent plain vulnerabilities still fire together with no interaction bugs', async () => {
+  const findings = await round2FindingsFor();
+  const hits = findings.filter((f) => f.file.includes('all-checks-interaction.js'));
+  const foundCheckIds = new Set(hits.map((f) => f.checkId));
+  const expectedCheckIds = [
+    'secret-hardcoded-generic',
+    'sql-string-concatenation',
+    'eval-on-input',
+    'cors-wildcard-with-credentials',
+    'missing-auth-middleware',
+    'weak-password-hashing',
+    'insecure-random-token',
+    'mass-assignment',
+    'insecure-cookie-flags',
+    'open-redirect',
+  ];
+  for (const checkId of expectedCheckIds) {
+    assert.ok(
+      foundCheckIds.has(checkId),
+      `expected ${checkId} to fire on all-checks-interaction.js -- a cross-check interaction regression (shared regex lastIndex leakage, one check's match window swallowing another's) may have appeared. Found instead: [${[...foundCheckIds].join(', ')}]`
+    );
+  }
+});
+
+// Round 2's realistic-library-code pass (2026-07-24) -- distinct from the adversarial
+// evasion samples above, these are ordinary Mongoose/Prisma/Node idioms (not attack
+// tricks) that a "would this catch real code" audit found undetected anyway. Fixed the
+// same day (see SECURITY_SCOPE.md's per-check entries).
+const REALISTIC_LIBRARY_GAPS_ROOT = path.join(EVASION_FIXTURES_ROOT, '18-realistic-library-gaps');
+let realisticLibraryGapsFindings;
+
+async function realisticLibraryGapsFindingsFor() {
+  realisticLibraryGapsFindings = realisticLibraryGapsFindings || (await scanRepo(REALISTIC_LIBRARY_GAPS_ROOT));
+  return realisticLibraryGapsFindings;
+}
+
+const REALISTIC_LIBRARY_GAP_CASES = [
+  ['11-multiline-uuid-generator.js', 'insecure-random-token', 'Math.random() buried inside a multi-line hand-rolled UUID generator callback'],
+  ['13-mongoose-findbyidandupdate.js', 'mass-assignment', 'req.body passed whole to Mongoose\'s findByIdAndUpdate()'],
+  ['13-prisma-data-key.js', 'mass-assignment', 'req.body nested under Prisma\'s { data: ... } call shape'],
+  ['15-new-url-base-redirect.js', 'open-redirect', 'a redirect target wrapped in new URL(req.query.next, base).toString()'],
+];
+
+for (const [filename, expectedCheckId, description] of REALISTIC_LIBRARY_GAP_CASES) {
+  test(`evasion-attempts/18-realistic-library-gaps/${filename}: ${expectedCheckId} still caught (${description})`, async () => {
+    const findings = await realisticLibraryGapsFindingsFor();
+    const hits = findings.filter((f) => f.checkId === expectedCheckId && f.file.includes(filename));
+    assert.ok(
+      hits.length >= 1,
+      `expected ${expectedCheckId} to fire on ${filename} (${description}) -- a round-2 realistic-library-code fix may have regressed`
+    );
+  });
+}
+
 // Regression samples for the two missing-auth-middleware (check 7) gaps found in the
 // follow-up ship-readiness audit (see SECURITY_SCOPE.md, check 7 limitations). Unlike
 // EVASION_CASES above, these aren't adversarial evasion tricks -- they're ordinary,

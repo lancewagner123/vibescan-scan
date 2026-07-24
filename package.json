@@ -14,7 +14,7 @@
     "SECURITY_SCOPE.md"
   ],
   "scripts": {
-    "test": "node --test test/e2e.test.js test/regression.test.js"
+    "test": "node --test test/e2e.test.js test/regression.test.js test/false-positives.test.js"
   },
   "engines": {
     "node": ">=22"
