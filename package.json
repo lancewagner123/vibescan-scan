@@ -1,0 +1,19 @@
+{
+  "name": "vibescan",
+  "version": "0.1.0",
+  "license": "UNLICENSED",
+  "description": "Security scanning for people who didn't write their own code.",
+  "type": "commonjs",
+  "bin": {
+    "vibescan": "bin/vibescan.js"
+  },
+  "scripts": {
+    "test": "node --test test/"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.32.0"
+  }
+}
