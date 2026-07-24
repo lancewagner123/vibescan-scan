@@ -257,3 +257,134 @@ by running the actual commands rather than trusting any single report:
    regression-tested (this entry).
 
 ### Final ship verdict: **Ship now.** No remaining named caveats from this session's punch list.
+
+## v1.1: 5 new checks (insecure-random-token, weak-password-hashing, mass-assignment, insecure-cookie-flags, open-redirect)
+
+**2026-07-24.** Five independent reviewers (PM, Security Engineer, Founder/Distribution,
+Skeptical Buyer, Final Auditor) evaluated v1.1 — the five checks added on top of the v1.0
+ten, taking `v0.2.0` from 10 to 15 total checks. Each read `docs/CHECK_CATALOG.md`,
+`SECURITY_SCOPE.md`, `README.md`, `package.json`, and `src/` directly and built their own
+adversarial test cases rather than trusting the prior verification report's prose.
+
+### Converged verdict: **Ship with named caveats.**
+
+All five reviewers independently landed on the same top-line verdict — not a split this
+time. `npm test` is 20/20 (independently re-run in this pass, matches). The demo-app
+fixture yields exactly 9 critical / 11 high / 1 medium / 0 low across all 15 unique
+checkIds (independently reproduced by two reviewers). All 15 evasion-attempts fixtures
+fire. No stale "10 checks" language anywhere in scope. Version is correctly `0.2.0`.
+
+**However, the Final Auditor found a real, blocking-grade gap the other four reviewers'
+adversarial tests happened not to hit, and per this project's own conflict-resolution rule
+(favor the conservative reading unless a disagreement is clearly a misunderstanding), that
+finding is treated as authoritative rather than averaged away.** This pass independently
+re-ran the Final Auditor's exact repro before writing it into `SECURITY_SCOPE.md` (not
+taken on faith):
+
+- An arrow-function helper (`const generateWeakValue = () => Math.random()...; const
+  resetToken = generateWeakValue();`) — the *identical* pattern
+  `SECURITY_SCOPE.md` already claims is closed for check 11, just spelled as an arrow
+  function instead of a `function` declaration — produces **zero findings**. Confirmed
+  live: `VibeScan: no issues found.`
+- A semicolon-free variable declaration (`const HASH_ALGO = 'md5'` then
+  `crypto.createHash(HASH_ALGO)`, no semicolons anywhere in the file) — produces **zero
+  findings** for check 12, while the identical semicoloned case still fires correctly.
+  Confirmed live.
+
+Root cause (read directly in `src/scanners/util.js`): `lookupFunctionReturnExpr` (line
+418) only matches a `function name(...) { ... }` declaration via regex — an arrow-function
+assignment is a different textual shape it was never written to recognize, not merely "one
+hop further." `resolveConcatExpression` and `resolveIdentifierChain` both require a
+literal trailing `;` in their declaration-matching regex, so semicolon-free code (a common,
+non-adversarial style — Standard.js, `semi:false`, plenty of AI-generated code) silently
+defeats the variable-hop resolution both helpers provide. These three shared helpers back
+the "same-day fixes" `SECURITY_SCOPE.md` credits to checks 5, 11, 12, 13, 14, and 15 — so
+this is a shared-root-cause gap across six claimed fixes, not an isolated miss in one
+check, and it is triggered by mainstream style choices, not adversarial obfuscation.
+
+This does not overturn the "ship with named caveats" verdict — every reviewer, including
+the Final Auditor, agreed the engineering bar (tests, fixture coverage, doc consistency,
+scope discipline) is genuinely met and the five checks are a real, honest addition, not
+scope creep. But it does mean the caveat has to be sharper than "these are heuristics with
+some documented limits" — `SECURITY_SCOPE.md` was, until this pass, actively overstating
+what got closed for six of its "same-day fixed" claims.
+
+### Caveats now made visible to users
+
+**Folded into `SECURITY_SCOPE.md` directly, as part of this entry (not just recorded
+here):** a new disclosure block immediately after the two red-team-pass paragraphs states,
+in the checks' own words, that (a) `lookupFunctionReturnExpr` only recognizes `function`
+declarations and is blind to arrow-function helpers for checks 5/11/14/15, (b)
+`resolveConcatExpression`/`resolveIdentifierChain` require a literal trailing `;` and are
+defeated by semicolon-free code for checks 12/13, and (c) every "closed the same day" claim
+for 5/11/12/13/14/15 should be read as "closed for `function`-declaration-and-semicolon
+styled code only" until both gaps are fixed.
+
+Already accurately disclosed before this pass, reaffirmed as still true:
+- All five new checks lean on naming/vocabulary heuristics (variable names, file-path
+  shape, literal algorithm names) more than the original ten's structural checks did —
+  documented per-check in `SECURITY_SCOPE.md`, and independently reproduced by the
+  Skeptical Buyer with two fresh hand-written bypasses (`magicLinkToken` naming evades
+  check 11; unsalted `sha256` evades check 12) that aren't even adversarial, just
+  differently-named ordinary code.
+- Three of the five (`mass-assignment`, `insecure-cookie-flags`, `open-redirect`) are
+  Express-API-shaped and detect nothing in Fastify/Koa/Next.js API routes/Django/Flask/
+  Rails — noted by the Skeptical Buyer, not yet called out as loudly in the README as the
+  "15 checks" headline is.
+- `mass-assignment`'s schema `category` is `injection` but it's operationally grouped with
+  the `authz` checks for extra-scrutiny purposes in `SECURITY_SCOPE.md`'s prose — the
+  mismatch is self-disclosed there but not reflected in `docs/FINDINGS_SCHEMA.md` itself,
+  so anything filtering findings programmatically by `category: authz` will silently miss
+  it (PM finding, minor, not blocking).
+- `insecure-random-token` and `weak-password-hashing` shipped as `critical` and were
+  downgraded to `high` in a same-day follow-up commit after an audit — a real
+  severity-rubric correction, caught same-day rather than by a customer, but a sign the
+  initial severity call wasn't fully settled before the first commit (Skeptical Buyer).
+
+### Prioritized punch list
+
+1. **Fix the two shared-helper gaps this pass found and disclosed** — extend
+   `lookupFunctionReturnExpr` (`src/scanners/util.js`) to also match
+   `const/let/var name = (...) => ...` arrow-function assignments, and loosen
+   `resolveConcatExpression`/`resolveIdentifierChain`'s declaration regex to accept
+   end-of-line/`\n` as an implicit terminator in addition to `;`. Add regression fixtures
+   for both the arrow-function and no-semicolon variants of checks 5/11/12/13/14/15. This
+   is the top-priority item — it's the gap between what `SECURITY_SCOPE.md` currently
+   claims and what the code actually does. (Adversarial repro scripts from the Final
+   Auditor's own pass were left in a scratch temp directory, not this repo, per the
+   review's file listing — not carried forward as fixtures automatically; write fresh ones
+   alongside the fix.)
+2. **Add a README-visible callout that checks 11-15 are judgment-heavier than 1-10** — the
+   PM and Founder both flagged that this risk currently only surfaces in
+   `SECURITY_SCOPE.md`'s per-check bullets, not in the top-line pitch a buyer reads first.
+3. **Make the AI-assistant-specific case for checks 11-15 explicit in the README/marketing
+   copy** — one sentence per new check tying it to a vibe-coding failure mode (Founder),
+   so the pitch doesn't read as generic OWASP-Top-10 feature-count competition.
+4. **Reconcile `mass-assignment`'s category classification** — either change its schema
+   `category` to something authz-adjacent or document the exception directly in
+   `docs/FINDINGS_SCHEMA.md`, not only in `SECURITY_SCOPE.md`'s prose (PM, minor).
+5. **Write down an explicit bar for check #16+** before adding more — AI-assistant-specific
+   pattern, evasion-tested, false-positive-audited against real (non-fixture) repos, not
+   just fixtures — so "narrow, closed list" doesn't quietly become "narrow this release"
+   (Founder).
+6. **Refresh stale inline comments in two evasion fixtures**
+   (`test/fixtures/evasion-attempts/13-mass-assignment/user-controller.js` and
+   `15-open-redirect/logout.js`) that still describe pre-fix behavior even though the
+   regression/e2e tests now assert the fix — internal-only, not a user-facing honesty
+   problem, but misleading to a future contributor skimming the fixture instead of running
+   the tests (Security Engineer).
+7. **One more red-team round before advertising checks 11-15 with the same confidence as
+   1-10** — five "found-and-fixed same day" cycles in a row, now including the gap this
+   pass itself found, is one hardening pass, not the track record 1-10 earned over time
+   (PM).
+
+**Reviewers:** PM, Security Engineer, Founder/Distribution, Skeptical Buyer, Final Auditor
+— each read `docs/CHECK_CATALOG.md`, `SECURITY_SCOPE.md`, `README.md`, `package.json`, and
+`src/` directly, independently ran `npm test` and the CLI against fixtures and their own
+hand-written adversarial samples.
+
+### Ready to push?
+
+Not this agent's call — per this task's instructions, pushing to GitHub or npm is left to
+the orchestrator to decide separately. This entry records the converged verdict and the
+punch list a push decision should weigh, not the push decision itself.
