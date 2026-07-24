@@ -34,14 +34,13 @@ function countOccurrences(haystack, needle) {
 // deliberate and is what makes its seeded git-history secret reachable at all: git-history.js
 // only ever inspects the exact repo root it's pointed at (`git log` resolves against
 // whichever repo the scanned path's nearest .git belongs to), and 03's own .git is that
-// nearest one. This is unrelated to (and does not fix) the still-open ancestor-repo scope
-// bug documented in SECURITY_SCOPE.md, where scanning a plain subdirectory that is *not*
-// its own git root can silently pick up an ancestor repo's history instead -- the other
-// nine folders below are not git roots themselves, so scanning them may also surface
-// incidental secret-git-history/secret-env-committed findings sourced from this actual
-// VibeScan repo's own history. That's expected noise from the known, documented bug, not
-// a false pass -- these tests only assert that each folder's *own* target checkId is
-// present, not that it's the only finding.
+// nearest one, so `git rev-parse --show-toplevel` there resolves to itself and the check
+// runs normally. The other nine folders are plain subdirectories of this actual VibeScan
+// repo, not git roots themselves -- guardGitHistoryScope() (src/scanners/util.js) detects
+// that mismatch and skips secret-git-history/secret-env-committed's git-history sub-scan
+// for them entirely (with a warning), rather than misattributing this repo's own history
+// to the scanned fixture. That's fine here: these tests only assert that each folder's
+// *own* target checkId is present, not that it's the only finding.
 const EVASION_CASES = [
   ['01-secret-hardcoded-generic', 'secret-hardcoded-generic'],
   ['02-secret-env-committed', 'secret-env-committed'],
