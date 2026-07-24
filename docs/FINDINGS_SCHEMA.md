@@ -13,6 +13,15 @@ Each scanner module returns an array of objects matching exactly:
   "rawMessage": "terse machine-oriented description of what matched"
 }
 
+**Known category exception:** `mass-assignment`'s `category` field is `injection` (the raw
+pattern it matches — unallowlisted assignment — fits that bucket), but `SECURITY_SCOPE.md`
+and `src/report/render.js`'s `HIGH_RISK_FIX_CHECK_IDS` treat it operationally as if it were
+`authz`-tier, because the underlying risk is privilege escalation (an attacker setting
+`isAdmin`/`role`/`verified`/`balance`), the same shape as the real `authz` checks. Anything
+filtering findings programmatically by `category === 'authz'` will not include
+`mass-assignment` — filter by `checkId` explicitly if you need that grouping, don't rely on
+`category` alone.
+
 # Triage Output Schema (output of src/triage/*, consumed by src/report/render.js)
 
 {

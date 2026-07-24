@@ -106,38 +106,39 @@ duplicated per check. As with checks 1-9 above, closing these specific samples i
 same as closing the general technique; each check's entry below documents what's still
 open.
 
-**Third-party audit finding (2026-07-24, same day): two of those three shared helpers have
-a mainstream-style-variant gap, not just a "next-level adversarial evasion" gap — this is
-more serious than the framing above and is called out here explicitly rather than folded
-quietly into each check's bullet.**
+**Third-party audit finding (2026-07-24, same day): two of those three shared helpers had
+a mainstream-style-variant gap, not just a "next-level adversarial evasion" gap — flagged
+as more serious than ordinary evasion framing, since it hit common code style rather than
+deliberate obfuscation. Fixed the same day (see below) — kept here as a "found honestly,
+fixed honestly" record, not as an open gap.**
 
-- **`lookupFunctionReturnExpr` only matches a `function name(...) { ... }` declaration.**
-  An arrow-function helper written the *exact same shape* the "same-day fix" above claims
-  to resolve — `const generateWeakValue = () => Math.random()...; const resetToken =
-  generateWeakValue();` — is invisible to it, not because it's a deeper hop, but because
-  the regex only recognizes the `function` keyword form. Confirmed by direct scan: this
-  defeats checks **5 (eval-on-input), 11 (insecure-random-token), 14
-  (insecure-cookie-flags), and 15 (open-redirect)** — every check that relies on this
-  helper. Arrow functions are, if anything, more common than `function` declarations in
-  modern JS/TS, including in AI-generated code, so this is not an edge case.
-- **`resolveConcatExpression` and `resolveIdentifierChain` both require a literal trailing
-  `;` to recognize a `const/let/var` declaration** (`` `(?:const|let|var)\s+${name}\s*=\s*([^;\n]+);` ``).
-  Any codebase not using semicolons (Standard.js style, `semi:false`, plenty of
-  AI-generated code) silently defeats the variable-hop resolution these helpers provide.
-  Confirmed by direct scan: `const HASH_ALGO = 'md5'` (no semicolon) followed by
-  `crypto.createHash(HASH_ALGO)` produces **no finding** for check 12
-  (weak-password-hashing), even though the identical literal-only case with a semicolon
-  fires correctly. The same gap applies to check 13 (mass-assignment)'s variable-hop
-  resolution.
+- **`lookupFunctionReturnExpr` originally only matched a `function name(...) { ... }`
+  declaration.** An arrow-function helper written the *exact same shape* the original
+  same-day fix claimed to resolve — `const generateWeakValue = () => Math.random()...`
+  (concise/implicit-return body) or with an explicit block body and `return` — was invisible
+  to it, defeating checks **5 (eval-on-input), 11 (insecure-random-token), 14
+  (insecure-cookie-flags), and 15 (open-redirect)**. **Fixed 2026-07-24:**
+  `lookupFunctionReturnExpr` now also matches `const/let/var name = (...) => { ... return
+  expr; ... }` and the concise-body form `const/let/var name = (...) => expr` (including a
+  bare single param with no parens, `x => expr`). Regression-tested via
+  `test/fixtures/evasion-attempts/16-mainstream-style-variants/arrow-function-token.js`
+  (wired into `test/regression.test.js`).
+- **`resolveConcatExpression` and `resolveIdentifierChain` originally required a literal
+  trailing `;` to recognize a `const/let/var` declaration.** Any codebase not using
+  semicolons (Standard.js style, `semi:false`, plenty of AI-generated code) silently
+  defeated the variable-hop resolution these helpers provide, affecting checks 12
+  (weak-password-hashing) and 13 (mass-assignment). **Fixed 2026-07-24:** both regexes no
+  longer require a trailing `;` — `[^;\n]+` already stops at the first `;` or newline on its
+  own, so the literal `;` requirement was only ever rejecting semicolon-free declarations,
+  not bounding the capture. Regression-tested via
+  `test/fixtures/evasion-attempts/16-mainstream-style-variants/no-semicolons-hash.js` (wired
+  into `test/regression.test.js`).
 
-Net effect: of the five "same-day" fixes touted for checks 11-15, the helper-call
-resolution (11, 14, 15) and the semicolon-dependent variable resolution (12, 13) are
-bypassed by ordinary style variation — not adversarial obfuscation. Treat every "closed
-the same day" claim for checks 5/11/12/13/14/15 in the per-check bullets below as "closed
-for `function`-declaration-and-semicolon-styled code only" until `lookupFunctionReturnExpr`
-is extended to arrow functions and the two resolver regexes accept an implicit end-of-line
-terminator. This is now the top-priority follow-up item for this tool (see punch list in
-`DECISIONS.md`).
+Net effect: both gaps were real (ordinary style variation, not adversarial obfuscation, defeating
+6 checks' worth of "same-day fixed" claims), and both are now closed and regression-tested,
+not just documented. As with checks 1-9's own follow-up fixes, closing these specific
+samples is still not the same as closing the general technique — see the per-check bullets
+below for what's still open at the next level of indirection.
 
 - **Secrets (checks 1-3):** literal-splitting and base64 decoding are now caught, but
   only one level deep and only via `+` concatenation or single-pass base64. A secret

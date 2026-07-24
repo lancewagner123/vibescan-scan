@@ -87,6 +87,44 @@ for (const [folder, expectedCheckId] of EVASION_CASES) {
   });
 }
 
+// 16-mainstream-style-variants is a different kind of regression case from EVASION_CASES
+// above: those are deliberate adversarial evasion tricks, but this folder's two files are
+// *ordinary, mainstream JS style choices* (an arrow-function helper with an implicit-return
+// body, and semicolon-free code) that a same-day audit (2026-07-24) found defeated checks
+// 11 and 12 anyway -- not because anyone was trying to evade detection, just because
+// lookupFunctionReturnExpr only recognized `function` declarations and
+// resolveConcatExpression/resolveIdentifierChain required a literal trailing `;`. Fixed the
+// same day in src/scanners/util.js. This is arguably more important to keep regression-safe
+// than the adversarial cases above, since it's common real-world code, not a crafted attack.
+const MAINSTREAM_STYLE_ROOT = path.join(EVASION_FIXTURES_ROOT, '16-mainstream-style-variants');
+let mainstreamStyleFindings;
+
+test('evasion-attempts/16-mainstream-style-variants/arrow-function-token.js: insecure-random-token still caught through an arrow-function helper', async () => {
+  mainstreamStyleFindings = mainstreamStyleFindings || (await scanRepo(MAINSTREAM_STYLE_ROOT));
+
+  const hits = mainstreamStyleFindings.filter(
+    (finding) => finding.checkId === 'insecure-random-token' && finding.file.includes('arrow-function-token.js')
+  );
+  assert.ok(
+    hits.length >= 1,
+    'expected insecure-random-token to fire on arrow-function-token.js -- lookupFunctionReturnExpr\'s ' +
+      'arrow-function support (block and concise/implicit-return bodies) may have regressed'
+  );
+});
+
+test('evasion-attempts/16-mainstream-style-variants/no-semicolons-hash.js: weak-password-hashing still caught in semicolon-free code', async () => {
+  mainstreamStyleFindings = mainstreamStyleFindings || (await scanRepo(MAINSTREAM_STYLE_ROOT));
+
+  const hits = mainstreamStyleFindings.filter(
+    (finding) => finding.checkId === 'weak-password-hashing' && finding.file.includes('no-semicolons-hash.js')
+  );
+  assert.ok(
+    hits.length >= 1,
+    'expected weak-password-hashing to fire on no-semicolons-hash.js -- resolveConcatExpression/' +
+      'resolveIdentifierChain\'s semicolon-optional fix may have regressed'
+  );
+});
+
 // Regression samples for the two missing-auth-middleware (check 7) gaps found in the
 // follow-up ship-readiness audit (see SECURITY_SCOPE.md, check 7 limitations). Unlike
 // EVASION_CASES above, these aren't adversarial evasion tricks -- they're ordinary,

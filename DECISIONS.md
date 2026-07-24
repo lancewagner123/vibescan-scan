@@ -388,3 +388,56 @@ hand-written adversarial samples.
 Not this agent's call — per this task's instructions, pushing to GitHub or npm is left to
 the orchestrator to decide separately. This entry records the converged verdict and the
 punch list a push decision should weigh, not the push decision itself.
+
+## Punch-list item 1 closed: mainstream-style-variant detection gap (2026-07-24)
+
+Fixed the top-priority item from the v0.2.0 panel's punch list — the gap between what
+`SECURITY_SCOPE.md` claimed was "closed the same day" and what the shared helpers in
+`src/scanners/util.js` actually resolved. Verified independently (not taking the prior
+report on faith) by reproducing both bypasses live before fixing:
+
+1. **`lookupFunctionReturnExpr`** only matched `function name(...) { ... }` declarations —
+   an arrow-function helper (`const gen = () => Math.random()...`, both concise/implicit-return
+   and block-body-with-`return` forms) was invisible to it, defeating checks 5, 11, 14, 15.
+   Fixed: now resolves both arrow-function forms in addition to the original `function`
+   declaration form.
+2. **`resolveConcatExpression`/`resolveIdentifierChain`** required a literal trailing `;` to
+   recognize a `const/let/var` declaration — semicolon-free code (Standard.js style,
+   `semi:false`) defeated checks 12 and 13. Fixed: the trailing `;` requirement was removed
+   (it was never load-bearing — `[^;\n]+` already stops at the first `;` or newline on its
+   own, so requiring a literal `;` right after only rejected semicolon-free declarations
+   without changing what got captured in the semicolon-present case).
+
+Also fixed while in the same file: a pre-existing, previously-deferred bug (`makeId()` had
+a stray literal NUL byte where a space was intended, causing `grep`/most text tooling to
+treat `util.js` as a binary file — noted as an incidental finding during the original build
+and explicitly deferred as "unrelated to this task" at the time; fixed now as a one-line,
+zero-risk cleanup while already touching this file).
+
+**Verification (real commands, not summarized from an agent report):** both original
+bypasses re-tested directly against the fixed helpers and confirmed resolved, with
+regression checks confirming the semicolon-present/`function`-declaration cases still work
+identically (no behavior change for the previously-working case). Added
+`test/fixtures/evasion-attempts/16-mainstream-style-variants/` (two files, one per gap) and
+wired both into `test/regression.test.js` — full suite now 22/22 passing (up from 20).
+`SECURITY_SCOPE.md`'s "Known evasion limitations" section rewritten to record this as
+found-and-fixed rather than an open gap.
+
+**Also closed, smaller punch-list items:**
+- Item 4 (mass-assignment category reconciliation) — documented the `category: injection`
+  vs. operational-`authz`-tier exception directly in `docs/FINDINGS_SCHEMA.md`, rather than
+  changing the actual `category` value (which existing code/tests depend on).
+- Item 6 (stale evasion-fixture comments) — `test/fixtures/evasion-attempts/13-mass-assignment/
+  user-controller.js` and `15-open-redirect/logout.js` had comments describing bypasses as
+  still-open when both are in fact now caught (confirmed by direct scan before editing);
+  rewritten to describe the fix, matching the "originally evaded, now fixed" convention
+  used elsewhere in this fixtures directory.
+
+**Left open, not addressed this pass** (lower priority, more judgment-dependent — punch-list
+items 2, 3, 5, 7): README-visible callout that checks 11-15 are judgment-heavier than 1-10;
+explicit per-check AI-codegen framing in marketing copy; a written bar for check #16+; one
+more full red-team round before advertising 11-15 with full confidence. These are copy/process
+decisions, not correctness bugs, and are reasonable to leave for whenever this ships toward
+real users rather than fix reflexively now.
+
+`npm test`: 22/22 passing. Committed on top of a clean tree.
