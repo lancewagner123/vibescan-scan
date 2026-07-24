@@ -52,6 +52,23 @@ const EVASION_CASES = [
   ['08-supabase-rls-disabled', 'supabase-rls-disabled'],
   ['09-stripe-webhook-unverified', 'stripe-webhook-unverified'],
   ['10-vulnerable-dependency', 'vulnerable-dependency'],
+  // Checks 11-15 (added in v0.2.0) were red-teamed in a follow-up pass (2026-07-24) that
+  // found all five bypassable with realistic code shapes -- bracket-notation/concatenated
+  // property names and one-hop function-call indirection (11), a variable holding the
+  // hash algorithm name (12), spread-into-object-literal and two-hop variable indirection
+  // (13), an options object built by a helper function call instead of an inline literal
+  // (14), and a redirect target routed through a same-file helper function (15). Each was
+  // fixed the same day (see SECURITY_SCOPE.md's "Known evasion limitations" section,
+  // checks 11-15 entries, and the shared resolveIdentifierChain/lookupFunctionReturnExpr/
+  // resolveConcatExpression helpers factored into src/scanners/util.js). Added here
+  // immediately, unlike checks 1-10 above (which had to wait for a later skeptical-buyer
+  // audit to notice they weren't wired into npm test) -- so a future refactor can't
+  // silently reopen any of these five without a test failing.
+  ['11-insecure-random-token', 'insecure-random-token'],
+  ['12-weak-password-hashing', 'weak-password-hashing'],
+  ['13-mass-assignment', 'mass-assignment'],
+  ['14-insecure-cookie-flags', 'insecure-cookie-flags'],
+  ['15-open-redirect', 'open-redirect'],
 ];
 
 for (const [folder, expectedCheckId] of EVASION_CASES) {

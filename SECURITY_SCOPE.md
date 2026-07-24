@@ -88,10 +88,23 @@ config values, and similar tricks. Each of those specific bypasses has since bee
 detected). But closing a *specific sample* is not the same as closing the *general
 technique* — every fix below is still a regex/text heuristic, not a real parser or a
 dataflow engine, and each one has a next-level evasion that would still get through.
-Documented here so the tool never silently implies more coverage than it has. (Checks
-11-15, added in v0.2.0, were not part of this specific red-team pass — see their own
-limitations entries below instead, written at build time rather than found by a later
-adversarial audit.)
+Documented here so the tool never silently implies more coverage than it has.
+
+A second, same-day follow-up red-team pass (also 2026-07-24) ran the identical exercise
+against the five checks added in v0.2.0 (checks 11-15; see
+`test/fixtures/evasion-attempts/11-*` through `15-*`) and found all five bypassable too —
+bracket-notation/concatenated property names and one-hop function-call indirection (11), a
+variable holding the hash algorithm name (12), spread-into-object-literal and two-hop
+variable indirection (13), an options object built by a helper function call (14), and a
+redirect target routed through a helper function (15). All five were fixed the same day
+(see each check's own entry below); the fixes share a common shape — resolving an
+identifier or call expression back through same-file `const/let/var` chains and function
+`return` statements — factored into three reusable helpers in `src/scanners/util.js`
+(`resolveIdentifierChain`, `lookupFunctionReturnExpr`, `resolveConcatExpression`) used by
+both `secrets.js` (checks 11-12) and `static-checks.js` (checks 4-9, 13-15) rather than
+duplicated per check. As with checks 1-9 above, closing these specific samples is not the
+same as closing the general technique; each check's entry below documents what's still
+open.
 
 - **Secrets (checks 1-3):** literal-splitting and base64 decoding are now caught, but
   only one level deep and only via `+` concatenation or single-pass base64. A secret
@@ -195,6 +208,22 @@ adversarial audit.)
   `oneTimeCode`) is not flagged even though the same predictability risk applies. Only
   JS/TS-family files are scanned — the same weak pattern in Python (`random.random()`),
   Ruby, PHP, etc. is not covered.
+  A follow-up red-team pass (2026-07-24) found and closed two specific bypasses **same
+  day**: (1) a bracket-notation/computed property name, including one built from
+  concatenated string literals (`user['session' + 'Id'] = Math.random()...`), which the
+  original name regex couldn't see at all since its character classes excluded quotes and
+  brackets — now matched, joined, and re-tested against the same keyword vocabulary; (2)
+  `Math.random()` moved one function call away (`const resetToken = weakRandomToken();`
+  where the helper's own body calls `Math.random()`) — now resolved by looking up the
+  helper's `return` expression (one hop, same convention as `eval-on-input`'s own
+  same-file-function resolution) and re-testing that. **Not closed, by design (a next-level
+  evasion of the same technique, not a fresh gap):** a *second* layer of function-call
+  indirection (`const t = outer(); function outer() { return inner(); } function inner() {
+  return Math.random()...; }`) is not traced — the helper-call resolution is exactly one
+  hop deep, same limit this codebase applies everywhere else it does this kind of
+  resolution. A bracket key built from a *variable* holding the property name
+  (`user[nameVar] = Math.random()...`) rather than a string literal is also not resolved —
+  only literal (or concatenated-literal) bracket keys are.
 - **Weak password hashing (check 12):** only recognizes `crypto.createHash('md5'|'sha1')`
   by name — a password hashed with a different fast/unsalted primitive (e.g. a single
   round of `sha256` with no salt, or a non-Node crypto library in a polyglot codebase) is
@@ -204,14 +233,35 @@ adversarial audit.)
   variable named something this check doesn't recognize (e.g. `secret_phrase`) can evade
   it, and a checksum helper that happens to hash a variable literally named `password` for
   an unrelated reason could still be flagged.
+  A follow-up red-team pass (2026-07-24) found and closed **same day**: the algorithm
+  argument no longer has to be a literal quoted string directly inside the call — a
+  variable holding the algorithm name (including one built from split string literals,
+  e.g. `const HASH_ALGO = 'm' + 'd5';`) is now resolved via `resolveConcatExpression`
+  (shared with the SQL-injection and missing-auth checks), which follows both `+`
+  concatenation and `const/let/var` identifier chains of arbitrary depth back to a single
+  string before testing it against `md5`/`sha1`. **Not closed:** the call's argument is
+  still extracted with a naive `[^)]*` regex, so an algorithm name computed by a *nested
+  call* (`crypto.createHash(getAlgo())`) is not resolved (the argument text itself is a
+  call expression, which `resolveConcatExpression` correctly declines to guess at rather
+  than silently assuming a result).
 - **Mass assignment (check 13):** only recognizes the three call shapes explicitly listed
   (`.create/update/save(req.body)`, `new Model(req.body)`, `Object.assign(existing,
-  req.body)`) and only resolves one same-file variable hop between `req.body`/`req.query`
-  and the call site. An ORM-specific bulk-write method this check doesn't know the name of
-  (e.g. a raw `.updateMany()`, a GraphQL resolver's input object, or a framework's own
-  "update from params" helper), a value passed through a second intermediate variable, or
-  `req.body` spread into an object literal (`{ ...req.body, id }`) instead of passed as a
-  whole argument, is not detected.
+  req.body)`). An ORM-specific bulk-write method this check doesn't know the name of (e.g.
+  a raw `.updateMany()`, a GraphQL resolver's input object, or a framework's own "update
+  from params" helper) is not detected.
+  A follow-up red-team pass (2026-07-24) found and closed **same day**: variable
+  resolution between `req.body`/`req.query` and the call site is no longer limited to one
+  hop — `resolveIdentifierChain` (util.js) now follows a chain of `const/let/var`
+  reassignments of arbitrary depth (bounded at 6 hops, to bail rather than loop forever on
+  a pathological chain), closing the "`const raw = req.body; const input = raw;
+  Model.create(input)`" gap. `{ ...req.body }` / `{ ...someVar }` (a spread-only object
+  literal — a shallow copy of every field, functionally identical to passing req.body
+  directly) is now also recognized, whereas before it matched neither the bare-`req.body`
+  text check nor the bare-identifier check. **Not closed, by design:** an object literal
+  that spreads req.body/req.query *alongside other explicit keys* (`{ ...req.body, id }`)
+  is treated as a partial allowlist and deliberately left out of scope, per the original
+  red-team suggestion — this is a real judgment call, not a proven-safe pattern, since the
+  explicit keys don't actually *remove* anything from the spread.
 - **Insecure cookie flags (check 14):** only inspects `res.cookie(...)` calls directly —
   a cookie set via a different mechanism (a raw `Set-Cookie` header string, a
   framework-specific session-cookie configuration object set once at app setup rather than
@@ -219,15 +269,35 @@ adversarial audit.)
   sensitive-cookie judgment is a name/value substring heuristic
   (`session`/`token`/`auth`/`jwt`/`secret`); a session cookie given an unrelated name
   (e.g. `sid`, `uid`) can evade detection entirely.
-- **Open redirect (check 15):** only resolves a redirect target one same-file variable hop
-  from `req.query`/`req.body`/`req.params`, and only recognizes a narrow set of guard
-  patterns (`.startsWith('/')`, an `allowlist`/`whitelist`-named `.includes()` check, or a
-  bare `.includes()` call) as "this looks validated" — a real validation function with a
+  A follow-up red-team pass (2026-07-24) found and closed **same day**: an options object
+  built by a same-file, zero-argument helper function (`const cookieOpts =
+  buildCookieOptions();`) is now resolved by looking up that function's `return`
+  expression and inspecting it directly if it's itself an object literal — before, any
+  non-object-literal declaration RHS (including a function call) made the check bail
+  entirely ("can't confirm, don't flag"). **Not closed:** a helper function that takes
+  arguments, builds its returned object conditionally, or itself calls a second helper is
+  not traced (one hop only, same limit applied throughout this codebase).
+- **Open redirect (check 15):** only recognizes a narrow set of guard patterns
+  (`.startsWith('/')`, an `allowlist`/`whitelist`-named `.includes()` check, or a bare
+  `.includes()` call) as "this looks validated" — a real validation function with a
   different name or shape (e.g. a same-file `isSafeRedirect(url)` helper, or validation
   performed in a different file/middleware) is invisible to this heuristic and will still
-  be flagged as a false positive. Symmetrically, a redirect target built through two or
-  more variable hops, or arriving via a header (`Referer`) instead of
-  query/body/params, is not traced and will not be flagged (a false negative).
+  be flagged as a false positive. A redirect target arriving via a header (`Referer`)
+  instead of query/body/params is not traced and will not be flagged (a false negative).
+  A follow-up red-team pass (2026-07-24) found and closed **same day**: the redirect target
+  variable is no longer limited to one hop back to `req.query`/`req.body`/`req.params` —
+  `resolveIdentifierChain` (util.js, shared with check 13) now follows a chain of
+  `const/let/var` reassignments of arbitrary depth. A redirect target routed through a
+  same-file helper function (`res.redirect(getRedirectTarget(req))` where the helper
+  returns `req.query.next || req.query.returnTo`) is also now resolved — by looking up the
+  helper's `return` expression and checking whether *any part of it* references
+  req.query/body/params, deliberately loose since a helper's return is often a
+  short-circuit `||` chain rather than one bare property access. **Not closed:** the
+  function-call resolution is one hop only, same limit applied throughout this codebase —
+  a second layer of function-call indirection is not traced. The "looks validated" guard
+  check is still applied to the raw call-expression text in this case (there's no resolved
+  variable name to check it against), so a validation guard written to check the
+  *helper's* return value rather than the outer call site is not recognized either.
 - **Ancestor-repo scope bug — now guarded, not open (not part of the 10 checks):**
   `secret-git-history` and `secret-env-committed`'s git-history sub-scan both run git
   commands with `cwd` set to the scanned path. If that path is a subdirectory of a larger

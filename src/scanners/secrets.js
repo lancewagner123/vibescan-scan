@@ -21,6 +21,8 @@ const {
   guardGitHistoryScope,
   findStringConcatChains,
   stripComments,
+  lookupFunctionReturnExpr,
+  resolveConcatExpression,
 } = require('./util');
 
 const CHECK_HARDCODED = 'secret-hardcoded-generic';
@@ -452,6 +454,75 @@ function checkInsecureRandomToken(clean, original) {
   return hits;
 }
 
+// --- Evasion-resistance: bracket-notation / concatenated property name -----------------
+//
+// TOKEN_ISH_NAME_SRC is built entirely from `[\w$.]*`/`[\w$]*` character classes, which
+// don't include `'`, `"`, `[`, or `]` -- so a property name written in bracket notation
+// (`user['sessionId'] = ...`), or worse, a bracket key itself built from concatenated
+// string literals (`user['session' + 'Id'] = ...`), is invisible to INSECURE_RANDOM_TOKEN_RE
+// even though it assigns the identical Math.random()-derived value to the identical logical
+// property. Matches any `[<quoted-literal-or-concat-chain>]` immediately followed by `:`/`=`
+// and a same-statement Math.random() call, then joins the bracket key's literal parts back
+// together (same join approach as findStringConcatChains) and tests the joined name against
+// the same token-ish keyword vocabulary TOKEN_ISH_NAME_SRC uses.
+const BRACKET_KEY_EXPR_SRC = "(?:['\"][\\w$]*['\"]\\s*\\+\\s*)*['\"][\\w$]*['\"]";
+const INSECURE_RANDOM_TOKEN_BRACKET_RE = new RegExp(
+  `\\[\\s*(${BRACKET_KEY_EXPR_SRC})\\s*\\]\\s*(?::|=(?!=|>))\\s*([^;\\n]*\\bMath\\.random\\(\\)[^;\\n]*)`,
+  'g',
+);
+const TOKEN_ISH_KEYWORD_RE = /(?:token|session[_-]?id|api[_-]?key|secret|nonce|csrf)/i;
+
+function checkInsecureRandomTokenBracket(clean, original) {
+  const hits = [];
+  INSECURE_RANDOM_TOKEN_BRACKET_RE.lastIndex = 0;
+  let m;
+  while ((m = INSECURE_RANDOM_TOKEN_BRACKET_RE.exec(clean)) !== null) {
+    const keyExpr = m[1];
+    const joined = [...keyExpr.matchAll(/['"]([\w$]*)['"]/g)].map((mm) => mm[1]).join('');
+    if (!TOKEN_ISH_KEYWORD_RE.test(joined)) continue;
+    hits.push({
+      line: lineOfIndex(original, m.index),
+      snippet: snippetAt(original, m.index),
+      rawMessage: `Math.random() is used to build the value assigned to a bracket-notation property that resolves to "${joined}" -- a name that suggests a security-sensitive token (session id, reset token, API key, secret, nonce, or CSRF token). Math.random() is not cryptographically secure and its output is predictable, so tokens built from it can be guessed -- use crypto.randomBytes(n).toString('hex') or crypto.randomUUID() instead.`,
+    });
+  }
+  return hits;
+}
+
+// --- Evasion-resistance: Math.random() moved one function call away --------------------
+//
+// checkInsecureRandomToken() above requires the token-ish name and a literal Math.random()
+// call to appear together, on the SAME statement -- it has no same-file function-body
+// lookup at all (unlike eval-on-input's argLooksInterpolated, which resolves one level of
+// same-file function call). So wrapping Math.random() in a helper function and assigning
+// the helper's *return value* to a token-ish name (`const resetToken = weakRandomToken();`)
+// defeats it completely, even though the token is exactly as predictable. Matches a
+// token-ish name assigned to a bare same-file function call, resolves that function's
+// return expression (lookupFunctionReturnExpr, shared with static-checks.js's checks 5/13/
+// 14/15 via util.js), and flags it if the return expression itself contains Math.random().
+const TOKEN_ASSIGNED_TO_CALL_RE = new RegExp(
+  `(${TOKEN_ISH_NAME_SRC})\\s*(?::|=(?!=|>))\\s*(?:await\\s+)?([A-Za-z_$][\\w$]*)\\s*\\(([^()]*)\\)\\s*;`,
+  'gi',
+);
+
+function checkInsecureRandomTokenViaHelperCall(clean, original) {
+  const hits = [];
+  TOKEN_ASSIGNED_TO_CALL_RE.lastIndex = 0;
+  let m;
+  while ((m = TOKEN_ASSIGNED_TO_CALL_RE.exec(clean)) !== null) {
+    const name = m[1];
+    const calleeName = m[2];
+    const returnExpr = lookupFunctionReturnExpr(clean, calleeName);
+    if (!returnExpr || !/\bMath\.random\(\)/.test(returnExpr)) continue;
+    hits.push({
+      line: lineOfIndex(original, m.index),
+      snippet: snippetAt(original, m.index),
+      rawMessage: `Math.random() is used (inside same-file helper function "${calleeName}()") to build the value assigned to "${name}", a name that suggests a security-sensitive token (session id, reset token, API key, secret, nonce, or CSRF token). Math.random() is not cryptographically secure and its output is predictable, so tokens built from it can be guessed -- use crypto.randomBytes(n).toString('hex') or crypto.randomUUID() instead.`,
+    });
+  }
+  return hits;
+}
+
 function scanInsecureRandomTokens(repoPath) {
   const findings = [];
   const files = walkFiles(repoPath, { extensions: RANDOM_TOKEN_SOURCE_EXTENSIONS });
@@ -460,7 +531,12 @@ function scanInsecureRandomTokens(repoPath) {
     if (!original) continue;
     const clean = stripComments(original);
     const repoRelPath = path.relative(repoPath, filePath).split(path.sep).join('/');
-    for (const hit of checkInsecureRandomToken(clean, original)) {
+    const hits = [
+      ...checkInsecureRandomToken(clean, original),
+      ...checkInsecureRandomTokenBracket(clean, original),
+      ...checkInsecureRandomTokenViaHelperCall(clean, original),
+    ];
+    for (const hit of hits) {
       findings.push({
         id: makeId(CHECK_INSECURE_RANDOM_TOKEN, [repoRelPath, String(hit.line), hit.snippet]),
         checkId: CHECK_INSECURE_RANDOM_TOKEN,
@@ -484,7 +560,17 @@ function scanInsecureRandomTokens(repoPath) {
 // partially. Only flag this in a context that actually looks password-related, so a
 // checksum helper hashing file contents with md5 elsewhere in the codebase isn't swept
 // in.
-const WEAK_HASH_ALGO_RE = /crypto\s*\.\s*createHash\s*\(\s*(['"`])(md5|sha1)\1\s*\)/gi;
+//
+// The algorithm argument is captured as raw text (CREATE_HASH_CALL_RE, below) rather than
+// requiring a literal quoted 'md5'/'sha1' directly inside the call -- the previous
+// literal-only regex (WEAK_HASH_ALGO_RE) never matched a variable holding the algorithm
+// name at all, even a trivially-obfuscated one built from split literals
+// (`const HASH_ALGO = 'm' + 'd5';`), so the password-context heuristics below never even
+// got a chance to run. resolveConcatExpression (util.js, shared with static-checks.js's
+// SQL and route-path checks) already resolves both a bare literal argument AND an
+// identifier chain through any number of `const/let/var` hops and `+` concatenations back
+// to a single string, so it's reused here rather than duplicating that resolution logic.
+const CREATE_HASH_CALL_RE = /crypto\s*\.\s*createHash\s*\(\s*([^)]*)\)/gi;
 const PASSWORD_CONTEXT_RE = /\b(password|passwd|pwd)\b/i;
 const AUTH_FILE_PATH_RE = /(^|\/)(auth|login|log-in|signup|sign-up|register|registration)([./]|$)/i;
 
@@ -507,20 +593,29 @@ function currentStatementWindow(text, index) {
 function checkWeakPasswordHashing(clean, original, repoRelPath) {
   const hits = [];
   const fileLooksAuthy = AUTH_FILE_PATH_RE.test(repoRelPath);
-  WEAK_HASH_ALGO_RE.lastIndex = 0;
+  CREATE_HASH_CALL_RE.lastIndex = 0;
   let m;
-  while ((m = WEAK_HASH_ALGO_RE.exec(clean)) !== null) {
-    const algo = m[2].toLowerCase();
+  while ((m = CREATE_HASH_CALL_RE.exec(clean)) !== null) {
+    const rawArg = m[1].trim();
+    if (!rawArg) continue;
+    const resolved = resolveConcatExpression(clean, rawArg);
+    if (resolved === null) continue; // can't confirm the algorithm name -- bail rather than guess
+    const algo = resolved.toLowerCase();
+    if (algo !== 'md5' && algo !== 'sha1') continue;
     const statement = currentStatementWindow(clean, m.index);
     const nearbyLooksPasswordy = PASSWORD_CONTEXT_RE.test(statement);
     if (!nearbyLooksPasswordy && !fileLooksAuthy) continue; // no password-ish signal at all -- likely a checksum/etag use, leave it alone
     const reason = nearbyLooksPasswordy
       ? 'a nearby variable/argument name suggests it is hashing a password'
       : `the file ("${repoRelPath}") looks like an auth/login/signup/register route or module`;
+    const viaVariable = rawArg !== `'${algo}'` && rawArg !== `"${algo}"` && rawArg !== `\`${algo}\``;
+    const algoDescription = viaVariable
+      ? `resolves (via "${rawArg}") to '${algo}'`
+      : `is called with '${algo}'`;
     hits.push({
       line: lineOfIndex(original, m.index),
       snippet: snippetAt(original, m.index),
-      rawMessage: `crypto.createHash('${algo}') is used where ${reason} -- ${algo.toUpperCase()} is fast and unsalted, so a breached password database hashed this way is fully crackable at scale. Use bcrypt, scrypt, or argon2 instead.`,
+      rawMessage: `crypto.createHash(...) ${algoDescription} where ${reason} -- ${algo.toUpperCase()} is fast and unsalted, so a breached password database hashed this way is fully crackable at scale. Use bcrypt, scrypt, or argon2 instead.`,
     });
   }
   return hits;

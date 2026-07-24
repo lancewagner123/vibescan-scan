@@ -7,7 +7,18 @@
 // secrets.js, not here.)
 
 const path = require('path');
-const { walkFiles, readTextFile, makeId, stripComments } = require('./util');
+const {
+  walkFiles,
+  readTextFile,
+  makeId,
+  stripComments,
+  extractBalancedBraceBlock,
+  extractBalancedCallArg,
+  splitTopLevelArgs,
+  lookupFunctionReturnExpr,
+  resolveConcatExpression,
+  resolveIdentifierChain,
+} = require('./util');
 
 const SOURCE_EXTENSIONS = ['.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs'];
 
@@ -22,59 +33,10 @@ function snippetAt(text, index, len = 160) {
   return text.slice(lineStart, lineEnd).trim().slice(0, len);
 }
 
-/**
- * Given text and the index of an opening '{', walk forward tracking brace depth to find
- * the matching '}', returning the full block (including both braces). Heuristic, not a
- * real parser -- doesn't treat quoted/template-literal content as opaque the way
- * extractBalancedCallArg does, but it's only ever called against `clean` (comments
- * already blanked) on narrow, function-body-shaped text, where a stray brace inside a
- * string is rare enough to accept as a v1 limitation. Returns null if unbalanced.
- */
-function extractBalancedBraceBlock(text, openBraceIndex) {
-  let depth = 0;
-  for (let i = openBraceIndex; i < text.length; i++) {
-    const ch = text[i];
-    if (ch === '{') depth++;
-    else if (ch === '}') {
-      depth--;
-      if (depth === 0) return text.slice(openBraceIndex, i + 1);
-    }
-  }
-  return null;
-}
-
-/**
- * Resolve a simple `identifier + identifier`/`identifier + 'literal'`/`'literal' + ...`
- * chain (as found in `expr`) to a single string, one level of `const/let/var` lookup
- * deep for any bare identifier operand. Returns null (rather than guessing) the moment it
- * hits anything it can't confidently resolve -- a function call, a member expression it
- * can't find a declaration for, etc. Used to defeat "route path built via concatenation"
- * and similar literal-splitting evasions without needing a real parser.
- */
-function resolveConcatExpression(clean, expr) {
-  const parts = expr.split('+').map((p) => p.trim());
-  let resolved = '';
-  for (const part of parts) {
-    const litMatch = part.match(/^['"`]((?:[^'"`\\\n]|\\.)*)['"`]$/);
-    if (litMatch) {
-      resolved += litMatch[1];
-      continue;
-    }
-    const identMatch = part.match(/^[A-Za-z_$][\w$]*$/);
-    if (identMatch) {
-      const escaped = part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-      const declRe = new RegExp(`(?:const|let|var)\\s+${escaped}\\s*=\\s*([^;\\n]+);`);
-      const dm = clean.match(declRe);
-      if (!dm) return null;
-      const subResolved = resolveConcatExpression(clean, dm[1]);
-      if (subResolved === null) return null;
-      resolved += subResolved;
-      continue;
-    }
-    return null; // not a plain literal or a resolvable identifier -- bail rather than guess
-  }
-  return resolved;
-}
+// extractBalancedBraceBlock and resolveConcatExpression now live in ./util.js (moved
+// 2026-07-24, evasion-bypass hardening pass) so secrets.js's checks 11-12 can reuse the
+// exact same "look inside a same-file function/variable declaration" logic instead of
+// duplicating it. Imported above.
 
 // Every check below matches against `clean` (comments blanked out via stripComments)
 // but reports line numbers/snippets against `original` (unmodified source), so what a
@@ -222,84 +184,11 @@ function checkSqlStringConcatenation(clean, filePath, original) {
 
 const DANGEROUS_CALLEE_RE = /\b(eval|new\s+Function|exec|execSync)\s*\(/g;
 
-/**
- * Given text and the index of an opening '(', walk forward tracking paren depth to find
- * the matching ')', treating quoted/template-literal content as opaque (so parens inside
- * a string or inside a `${...}` don't throw off the depth count). A naive `[^)]*` regex
- * breaks the moment the argument itself contains a nested call, e.g.
- * `eval(\`console.log(${x})\`)` — the first `)` it sees is the one that closes
- * `console.log(...)`, not the one that closes `eval(...)`. Returns null if unbalanced.
- */
-function extractBalancedCallArg(text, openParenIndex) {
-  let depth = 0;
-  let inString = null; // one of ' " ` while inside a string/template literal
-  for (let i = openParenIndex; i < text.length; i++) {
-    const ch = text[i];
-    if (inString) {
-      if (ch === '\\') { i++; continue; } // skip escaped char, including escaped quote
-      if (ch === inString) inString = null;
-      continue;
-    }
-    if (ch === '"' || ch === "'" || ch === '`') { inString = ch; continue; }
-    if (ch === '(') depth++;
-    else if (ch === ')') {
-      depth--;
-      if (depth === 0) return { end: i, arg: text.slice(openParenIndex + 1, i) };
-    }
-  }
-  return null;
-}
-
-/**
- * Split a call's argument-list text (the contents extracted by extractBalancedCallArg,
- * i.e. everything between the outer parens) into its top-level comma-separated arguments.
- * Tracks (), {}, [] nesting depth and quoted/template-literal string content so a comma
- * *inside* a nested call/object/array/string (e.g. `Model.create({ a: 1, b: 2 }, opts)`'s
- * first argument) isn't mistaken for an argument separator. Used by the mass-assignment
- * and insecure-cookie-flags checks below, both of which need to reason about individual
- * arguments of a call rather than the whole argument-list text at once.
- * @param {string} argsText
- * @returns {string[]}
- */
-function splitTopLevelArgs(argsText) {
-  const parts = [];
-  let depth = 0;
-  let inString = null; // one of ' " ` while inside a string/template literal
-  let current = '';
-  for (let i = 0; i < argsText.length; i++) {
-    const ch = argsText[i];
-    if (inString) {
-      current += ch;
-      if (ch === '\\') { i++; current += argsText[i] || ''; continue; }
-      if (ch === inString) inString = null;
-      continue;
-    }
-    if (ch === '"' || ch === "'" || ch === '`') { inString = ch; current += ch; continue; }
-    if (ch === '(' || ch === '{' || ch === '[') depth++;
-    if (ch === ')' || ch === '}' || ch === ']') depth--;
-    if (ch === ',' && depth === 0) { parts.push(current); current = ''; continue; }
-    current += ch;
-  }
-  if (current.trim() !== '') parts.push(current);
-  return parts;
-}
-
-// Looks up `function <name>(...) { ... }` in `clean` and returns the expression in its
-// first `return` statement, or null if the function/return can't be found. Regex-located,
-// not a real parser -- deliberately only one level (callers don't recurse through this a
-// second time), which is cheap and enough to catch the common "wrap the interpolation in
-// a same-file helper" evasion without the complexity of real dataflow analysis.
-function lookupFunctionReturnExpr(clean, calleeName) {
-  const escaped = calleeName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const declRe = new RegExp(`function\\s+${escaped}\\s*\\([^)]*\\)\\s*\\{`);
-  const m = declRe.exec(clean);
-  if (!m) return null;
-  const braceIndex = m.index + m[0].length - 1;
-  const body = extractBalancedBraceBlock(clean, braceIndex);
-  if (!body) return null;
-  const rm = body.match(/return\s+([^;]+);/);
-  return rm ? rm[1] : null;
-}
+// extractBalancedCallArg, splitTopLevelArgs, and lookupFunctionReturnExpr now live in
+// ./util.js (moved 2026-07-24, evasion-bypass hardening pass) — imported above. Shared by
+// the mass-assignment, insecure-cookie-flags, and open-redirect checks below (which need
+// to reason about individual call arguments) and by secrets.js's checks 11-12 (which need
+// the same "look inside a same-file function body" resolution these checks already used).
 
 function argLooksInterpolated(arg, clean) {
   const trimmed = arg.trim();
@@ -769,20 +658,45 @@ const OBJECT_ASSIGN_CALL_RE = /\bObject\.assign\s*\(/g;
 // Confirms an individual (already top-level-split) call argument is the WHOLE req.body/
 // req.query object, not a specific field pulled off it (`req.body.name` doesn't match --
 // that's a single field, not mass assignment) and not something already destructured into
-// an allowlist. Resolves one variable hop, same "one-hop" precedent used by the CORS check
-// above: `const data = req.body; Model.create(data)` is exactly as dangerous as passing
-// req.body inline, just one assignment further away. Requires the ENTIRE declaration to be
-// `identifier = req.body;` (or req.query) with nothing else on the RHS -- a destructuring
-// assignment (`const { name, email } = req.body;`) has an object pattern on the LHS, not a
-// bare identifier, so it never matches this and is correctly treated as already-allowlisted.
+// an allowlist. Resolves ANY number of variable hops via resolveIdentifierChain (util.js)
+// -- `const raw = req.body; const input = raw; Model.create(input)` is exactly as
+// dangerous as passing req.body inline, just two assignments further away, and is now
+// followed all the way back rather than bailing after one hop. Requires the ENTIRE
+// declaration to be `identifier = req.body;` (or req.query) with nothing else on the RHS --
+// a destructuring assignment (`const { name, email } = req.body;`) has an object pattern on
+// the LHS, not a bare identifier, so it never matches this and is correctly treated as
+// already-allowlisted.
+//
+// Also recognizes `{ ...req.body }` / `{ ...someVar }` (spread-only object literals, where
+// someVar itself resolves back to req.body/req.query via the same chain) -- a shallow copy
+// of every field, functionally identical to passing req.body directly, but syntactically an
+// object-literal expression rather than a bare identifier or the literal text "req.body". An
+// object literal that spreads req.body/req.query *alongside other explicit keys*
+// (`{ ...req.body, id }`) is arguably a partial allowlist and deliberately left out of scope
+// here, same as the original red-team suggestion.
+function isReqBodyOrQueryExpr(text) {
+  return /^req\.(?:body|query)$/.test(text.trim());
+}
+
 function argIsWholeReqBodyOrQuery(arg, clean) {
   const trimmed = arg.trim();
-  if (/^req\.(?:body|query)$/.test(trimmed)) return true;
+  if (isReqBodyOrQueryExpr(trimmed)) return true;
+
+  const spreadMatch = trimmed.match(/^\{\s*\.\.\.\s*([A-Za-z_$][\w.$]*)\s*\}$/);
+  if (spreadMatch) {
+    const spreadTarget = spreadMatch[1];
+    if (isReqBodyOrQueryExpr(spreadTarget)) return true;
+    if (/^[A-Za-z_$][\w$]*$/.test(spreadTarget)) {
+      const resolved = resolveIdentifierChain(clean, spreadTarget);
+      if (resolved && isReqBodyOrQueryExpr(resolved)) return true;
+    }
+    return false;
+  }
+
   const identMatch = trimmed.match(/^[A-Za-z_$][\w$]*$/);
   if (identMatch) {
-    const escaped = trimmed.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const declRe = new RegExp(`(?:const|let|var)\\s+${escaped}\\s*=\\s*(req\\.(?:body|query))\\s*;`);
-    if (declRe.test(clean)) return true;
+    const resolved = resolveIdentifierChain(clean, trimmed);
+    if (resolved && isReqBodyOrQueryExpr(resolved)) return true;
   }
   return false;
 }
@@ -859,19 +773,36 @@ const HTTP_ONLY_TRUE_RE = /\bhttpOnly\s*:\s*true\b/i;
 const SECURE_TRUE_RE = /\bsecure\s*:\s*true\b/i;
 
 // Resolves `optionsVar` back to its own object-literal declaration (`const opts = {
-// httpOnly: true, ... };`), the same one-variable-hop precedent used elsewhere in this
-// file, so `res.cookie('sid', id, cookieOpts)` can be checked just as well as an inline
-// options object. Returns null (rather than guessing) if the variable's declaration isn't
-// a plain object literal this file can see -- e.g. it's imported from another module, or
-// built conditionally -- so an unresolvable options variable is treated as "can't confirm"
-// and not flagged, matching this codebase's existing bail-rather-than-guess convention.
+// httpOnly: true, ... };`), so `res.cookie('sid', id, cookieOpts)` can be checked just as
+// well as an inline options object. Also follows one further step when the declaration's
+// RHS is a call to a same-file, zero-argument function (`const cookieOpts =
+// buildCookieOptions();`) by looking up that function's own `return` expression
+// (lookupFunctionReturnExpr, shared with checks 11-12 via util.js) and using *that* if it
+// is itself an object literal -- closing the "options object built by a helper function
+// instead of an inline literal" gap, the same "one hop isn't enough" shape as the
+// mass-assignment and open-redirect checks. Returns null (rather than guessing) if neither
+// shape resolves -- e.g. the variable is imported from another module, built
+// conditionally, or the helper function's return isn't a plain object literal -- so an
+// unresolvable options variable is treated as "can't confirm" and not flagged, matching
+// this codebase's existing bail-rather-than-guess convention.
 function resolveObjectLiteralVar(clean, varName) {
   const escaped = varName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const declRe = new RegExp(`(?:const|let|var)\\s+${escaped}\\s*=\\s*\\{`);
-  const m = declRe.exec(clean);
-  if (!m) return null;
-  const braceIndex = m.index + m[0].length - 1; // index of the declaration's opening '{'
-  return extractBalancedBraceBlock(clean, braceIndex);
+
+  const objDeclRe = new RegExp(`(?:const|let|var)\\s+${escaped}\\s*=\\s*\\{`);
+  const om = objDeclRe.exec(clean);
+  if (om) {
+    const braceIndex = om.index + om[0].length - 1; // index of the declaration's opening '{'
+    return extractBalancedBraceBlock(clean, braceIndex);
+  }
+
+  const callDeclRe = new RegExp(`(?:const|let|var)\\s+${escaped}\\s*=\\s*([A-Za-z_$][\\w$]*)\\s*\\(\\s*\\)\\s*;`);
+  const cm = callDeclRe.exec(clean);
+  if (cm) {
+    const returnExpr = lookupFunctionReturnExpr(clean, cm[1]);
+    if (returnExpr && /^\{/.test(returnExpr.trim())) return returnExpr.trim();
+  }
+
+  return null;
 }
 
 function checkInsecureCookieFlags(clean, filePath, original) {
@@ -935,22 +866,46 @@ function checkInsecureCookieFlags(clean, filePath, original) {
 // silently forwards a victim to an attacker-controlled site -- a common phishing vector.
 const RES_REDIRECT_CALL_RE = /\bres\.redirect\s*\(/g;
 const REQ_SOURCE_PROP_RE = /^req\.(?:query|body|params)(?:\.[\w$]+)?$/;
+// Looser than REQ_SOURCE_PROP_RE: matches a req.query/body/params reference ANYWHERE in an
+// arbitrary expression, not just as the expression's entire text -- needed for the
+// function-return-expression case just below, where the resolved expression is often a
+// short-circuit chain (`req.query.next || req.query.returnTo`) rather than a single bare
+// property access.
+const REQ_SOURCE_PROP_ANYWHERE_RE = /\breq\.(?:query|body|params)\b/;
 
-// Resolves a bare identifier back to a same-file req.query/req.body/req.params origin, one
-// hop deep, in either of the two shapes real code actually uses:
+// Resolves a bare identifier back to a same-file req.query/req.body/req.params origin, in
+// either of the two shapes real code actually uses:
 //   const url = req.query.redirect;              -- direct property/whole-object assignment
+//     (any number of further `const x = y;` variable hops away, via resolveIdentifierChain)
 //   const { redirect: url } = req.query;          -- destructured (with or without rename)
 // Returns the source expression string (e.g. "req.query.redirect") if resolved, else null.
 function resolveVarFromReqSource(clean, varName) {
+  const resolved = resolveIdentifierChain(clean, varName);
+  if (resolved && REQ_SOURCE_PROP_RE.test(resolved)) return resolved;
+
   const escaped = varName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const directRe = new RegExp(`(?:const|let|var)\\s+${escaped}\\s*=\\s*(req\\.(?:query|body|params)(?:\\.[\\w$]+)?)\\s*;`);
-  const dm = clean.match(directRe);
-  if (dm) return dm[1];
   const destructureRe = new RegExp(
     `(?:const|let|var)\\s*\\{[^}]*\\b(?:${escaped}|[\\w$]+\\s*:\\s*${escaped})\\b[^}]*\\}\\s*=\\s*(req\\.(?:query|body|params))\\s*;`,
   );
   const destM = clean.match(destructureRe);
   return destM ? destM[1] : null;
+}
+
+// Resolves a call expression (e.g. `getRedirectTarget(req)`) back to a same-file function's
+// return expression (lookupFunctionReturnExpr, shared with checks 11-12/14 via util.js)
+// and checks whether THAT expression references req.query/body/params anywhere -- closes
+// the "route the tainted value through a same-file helper function" gap, the same "one hop
+// isn't enough" shape as the mass-assignment and insecure-cookie-flags checks. Deliberately
+// loose (REQ_SOURCE_PROP_ANYWHERE_RE, not the anchored REQ_SOURCE_PROP_RE) since a helper's
+// return is often a short-circuit chain (`req.query.next || req.query.returnTo`), not a
+// single bare property access. Returns the resolved return-expression text if it looks
+// req-sourced, else null.
+function resolveCallExprFromReqSource(clean, targetArg) {
+  const callMatch = targetArg.match(/^([A-Za-z_$][\w$]*)\s*\(([^()]*)\)$/);
+  if (!callMatch) return null;
+  const returnExpr = lookupFunctionReturnExpr(clean, callMatch[1]);
+  if (returnExpr && REQ_SOURCE_PROP_ANYWHERE_RE.test(returnExpr)) return returnExpr.trim();
+  return null;
 }
 
 // Best-effort "this looks validated" guard, checked in a window immediately before the
@@ -1000,6 +955,9 @@ function checkOpenRedirect(clean, filePath, original) {
         sourceExpr = resolved;
         resolvedVarName = targetArg;
       }
+    } else {
+      const resolved = resolveCallExprFromReqSource(clean, targetArg);
+      if (resolved) sourceExpr = resolved;
     }
     if (!sourceExpr) continue;
     if (hasNearbyRedirectValidation(clean, m.index, resolvedVarName || targetArg)) continue;
