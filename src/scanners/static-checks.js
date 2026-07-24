@@ -437,13 +437,14 @@ function routeCallHasEnforcedAuth(clean, callIndex) {
   return AUTH_ENFORCEMENT_RE.test(callText);
 }
 
-function findMissingAuthHits(clean, original, routeRe) {
+function findMissingAuthHits(clean, original, routeRe, guardIndexes) {
   const hits = [];
   routeRe.lastIndex = 0;
   let m;
   while ((m = routeRe.exec(clean)) !== null) {
     const routePath = m[3];
     if (routeCallHasEnforcedAuth(clean, m.index)) continue;
+    if (hasAuthGuardUseBefore(guardIndexes, m.index)) continue;
     hits.push({
       line: lineOfIndex(original, m.index),
       snippet: snippetAt(original, m.index),
@@ -453,7 +454,7 @@ function findMissingAuthHits(clean, original, routeRe) {
   return hits;
 }
 
-function findMissingAuthHitsFromConcatPaths(clean, original) {
+function findMissingAuthHitsFromConcatPaths(clean, original, guardIndexes) {
   const hits = [];
   ROUTE_CALL_CONCAT_RE.lastIndex = 0;
   let m;
@@ -461,6 +462,7 @@ function findMissingAuthHitsFromConcatPaths(clean, original) {
     const resolved = resolveConcatExpression(clean, m[2]);
     if (!resolved || !SENSITIVE_PATH_PREFIX_RE.test(resolved)) continue;
     if (routeCallHasEnforcedAuth(clean, m.index)) continue;
+    if (hasAuthGuardUseBefore(guardIndexes, m.index)) continue;
     hits.push({
       line: lineOfIndex(original, m.index),
       snippet: snippetAt(original, m.index),
@@ -470,18 +472,110 @@ function findMissingAuthHitsFromConcatPaths(clean, original) {
   return hits;
 }
 
+// --- Case D (gap A, 2026-07-24 audit): chained `.route(path).method(...)` syntax --------
+// Express's chainable Router syntax splits the path literal and the HTTP-method call
+// across two separate expressions -- `router.route('/admin/dashboard').get(handler)`
+// first registers the path via `.route(path)`, then chains `.get/.post/etc(...)` directly
+// off the SAME expression. SENSITIVE_ROUTE_INLINE_RE (and the concat variant) both require
+// the path literal and the HTTP-method call to appear together in one `.method(path, ...)`
+// invocation, so this idiomatic, extremely common form was invisible to either -- neither
+// half of the chain looks like a route registration on its own.
+const ROUTE_CHAIN_RE = /\.route\s*\(\s*(['"`])(\/(?:admin|internal|_debug|internal-api)[^'"`]*)\1\s*\)/gi;
+const CHAIN_METHOD_RE = /^(\s*\.\s*(get|post|put|delete|patch|all)\s*\()/i;
+
+// Starting immediately after a `.route(path)` call's closing paren, walks forward through
+// any directly-chained `.method(...)` calls (`.get(...).post(...)...`), returning each
+// one's method name and the index of its own `.method(` segment. That index is a valid
+// `callIndex` for routeCallHasEnforcedAuth, which only needs a position at-or-before the
+// call's opening paren with no OTHER '(' in between -- true here since CHAIN_METHOD_RE's
+// match contains no parens before the final one. Stops the moment the text no longer
+// continues the chain (a semicolon, unrelated code, end of file, etc).
+function findChainedRouteMethodCalls(clean, fromIndex) {
+  const calls = [];
+  let pos = fromIndex;
+  while (pos < clean.length) {
+    const slice = clean.slice(pos);
+    const m = CHAIN_METHOD_RE.exec(slice);
+    if (!m) break;
+    const openParenIndex = pos + m[1].length - 1;
+    const extracted = extractBalancedCallArg(clean, openParenIndex);
+    if (!extracted) break;
+    calls.push({ methodName: m[2].toLowerCase(), callIndex: pos });
+    pos = extracted.end + 1;
+  }
+  return calls;
+}
+
+function findMissingAuthHitsFromRouteChains(clean, original, guardIndexes) {
+  const hits = [];
+  ROUTE_CHAIN_RE.lastIndex = 0;
+  let m;
+  while ((m = ROUTE_CHAIN_RE.exec(clean)) !== null) {
+    const routePath = m[2];
+    const chainedCalls = findChainedRouteMethodCalls(clean, m.index + m[0].length);
+    for (const call of chainedCalls) {
+      if (routeCallHasEnforcedAuth(clean, call.callIndex)) continue;
+      if (hasAuthGuardUseBefore(guardIndexes, call.callIndex)) continue;
+      hits.push({
+        line: lineOfIndex(original, call.callIndex),
+        snippet: snippetAt(original, call.callIndex),
+        rawMessage: `Route handler for admin/internal-looking path "${routePath}" (registered via chained router.route(path).${call.methodName}(...) syntax) has no enforced auth/session/token check found in the same call's middleware chain or the handler body.`,
+      });
+    }
+  }
+  return hits;
+}
+
+// --- Case E (gap B, 2026-07-24 audit): router-level `.use(<identifier>)` guard ----------
+// A bare-identifier `.use()` call registered on a router/app BEFORE a route is defined
+// (`router.use(requireAuth)` followed further down by `router.get('/admin', handler)`) is
+// real, idiomatic Express middleware wiring that protects every route registered after it
+// -- not just the individual call `routeCallHasEnforcedAuth` already inspects in isolation.
+// Restricted to a genuinely BARE identifier argument (no inline arrow/function body, no
+// additional arguments) so this can't suppress findings for an unrelated body-parser/
+// logging middleware wired the same syntactic way, e.g. `router.use(express.json())` or
+// `router.use((req, res, next) => { log(req); next(); })` -- neither is a single bare
+// identifier. The identifier itself still has to look auth-ish by name.
+const USE_BARE_IDENTIFIER_RE = /\.use\s*\(\s*([A-Za-z_$][\w$]*)\s*\)/g;
+
+// Shares AUTH_KEYWORD_RE's keyword vocabulary but deliberately drops its leading `\b`
+// anchor: this is only ever tested against an ALREADY-ISOLATED bare identifier captured by
+// USE_BARE_IDENTIFIER_RE above (e.g. "requireAuth", "ensureLoggedIn"), never against a
+// wide text window, so a plain substring match can't spill into unrelated surrounding code
+// the way the anchored version elsewhere guards against. Anchoring \b before "auth" would
+// otherwise miss extremely common camelCase middleware names like "requireAuth" or
+// "checkAuth", where "auth"/"Auth" starts mid-identifier rather than at a word boundary --
+// exactly the shape of the router.use(requireAuth) idiom this case exists to recognize.
+const AUTH_MIDDLEWARE_NAME_RE = /(auth|session|token|jwt|passport|login|guard|protect|apikey|api_key)/i;
+
+function findAuthGuardUseIndexes(clean) {
+  const indexes = [];
+  USE_BARE_IDENTIFIER_RE.lastIndex = 0;
+  let m;
+  while ((m = USE_BARE_IDENTIFIER_RE.exec(clean)) !== null) {
+    if (AUTH_MIDDLEWARE_NAME_RE.test(m[1])) indexes.push(m.index);
+  }
+  return indexes;
+}
+
+function hasAuthGuardUseBefore(guardIndexes, callIndex) {
+  return guardIndexes.some((idx) => idx < callIndex);
+}
+
 function checkMissingAuthMiddleware(clean, filePath, original) {
   const normalized = filePath.split(path.sep).join('/');
+  const guardIndexes = findAuthGuardUseIndexes(clean);
   if (SENSITIVE_FILE_PATH_RE.test(normalized)) {
     // File itself lives under an admin/internal/debug path (e.g. routes/admin.js,
     // routes/debug.js) — treat every route call in it as a sensitive-route candidate,
     // since the real mount prefix that makes it sensitive typically lives in a
     // different file (the parent app.use('/admin', ...) call).
-    return findMissingAuthHits(clean, original, ANY_ROUTE_CALL_RE);
+    return findMissingAuthHits(clean, original, ANY_ROUTE_CALL_RE, guardIndexes);
   }
   return [
-    ...findMissingAuthHits(clean, original, SENSITIVE_ROUTE_INLINE_RE),
-    ...findMissingAuthHitsFromConcatPaths(clean, original),
+    ...findMissingAuthHits(clean, original, SENSITIVE_ROUTE_INLINE_RE, guardIndexes),
+    ...findMissingAuthHitsFromConcatPaths(clean, original, guardIndexes),
+    ...findMissingAuthHitsFromRouteChains(clean, original, guardIndexes),
   ];
 }
 

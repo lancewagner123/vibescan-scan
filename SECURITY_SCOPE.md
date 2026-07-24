@@ -108,17 +108,35 @@ Documented here so the tool never silently implies more coverage than it has:
   unrelated reasons could still suppress a genuinely unauthenticated route (a false
   negative). Neither direction is verified against what the "auth" code actually does.
   Two further gaps found in a follow-up audit (2026-07-24), on ordinary idiomatic
-  Express code rather than a crafted evasion sample:
-  - **False negative on chained route syntax:** `router.route('/admin/dashboard').get(handler)`
-    — Express's standard chainable form — produces zero findings even with no auth check
-    at all. The scanner only recognizes a route path and its HTTP-method call when both
-    appear in one `.method(...)` invocation; the chained form splits them across two
-    calls and neither is reassembled.
-  - **False positive on router-level middleware:** `router.use(requireAuth)` applied once
-    at the top of a router file, guarding every route defined below it, is not
-    recognized. Each `.get`/`.post` call is inspected in isolation, with no awareness of
-    a preceding `router.use(...)`, so every route in a file secured this very common way
-    gets flagged as missing auth.
+  Express code rather than a crafted evasion sample, were **fixed in a same-day follow-up
+  pass** (regression samples: `test/fixtures/regression-samples/chained-route-no-auth.js`
+  and `test/fixtures/regression-samples/router-use-guard-protected.js`):
+  - ~~False negative on chained route syntax~~ — **fixed.** `router.route('/admin/dashboard')
+    .get(handler)` (Express's standard chainable form) is now recognized: a sensitive-looking
+    path literal inside a `.route(...)` call is matched, and any `.get/.post/.put/.delete
+    /.patch/.all(...)` chained directly off that same expression is treated as an instance of
+    that route, subject to the same enforced-auth check as the inline form.
+  - ~~False positive on router-level middleware~~ — **fixed.** A `router.use(<identifier>)` /
+    `app.use(<identifier>)` call with a bare, auth-ish-named identifier argument (extended
+    name heuristic: `auth|session|token|jwt|passport|login|guard|protect|apikey|api_key`,
+    unanchored so common camelCase names like `requireAuth` match) occurring before a route's
+    position in the file now suppresses the missing-auth finding for every route after it —
+    matching the real Express semantics of router-level middleware.
+
+  Remaining limitations in these two fixes, not yet covered:
+  - The chained-route fix only covers the literal-sensitive-path shape
+    (`.route('/admin/...')`) and only directly-adjacent `.method(...)` links off that same
+    expression. A route object captured in a variable first (`const r = router.route('/admin');
+    r.get(...)`), or a chained path built via concatenation (`.route(ADMIN_BASE + '/x')`), is
+    not recognized.
+  - The `router.use(<identifier>)` guard is applied purely positionally (index of the `.use()`
+    call vs. index of the route call in the same file) — it does not verify the `.use()` call
+    and the later route actually share the same router/app object, and does not account for
+    the guard being registered inside a conditional branch that may never execute. A guard
+    wired as a member expression (`router.use(mw.requireAuth)`) or passed as an array
+    (`router.use([a, b])`) is not recognized as a bare identifier and such routes will still
+    (conservatively) be flagged. And as always, the identifier's name is still just a naming
+    heuristic, not confirmation that the referenced function actually enforces anything.
 - **Supabase RLS (check 8):** the nested-key RLS pattern only matches one level of `{
   ... }` nesting with `enabled: false` textually close to the `rls`/`row_level_security`
   key; a differently-shaped toggle (a string value like `"disabled"`, a boolean stored
