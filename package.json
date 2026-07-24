@@ -7,6 +7,12 @@
   "bin": {
     "vibescan": "bin/vibescan.js"
   },
+  "files": [
+    "bin",
+    "src",
+    "docs",
+    "SECURITY_SCOPE.md"
+  ],
   "scripts": {
     "test": "node --test test/e2e.test.js test/regression.test.js"
   },
