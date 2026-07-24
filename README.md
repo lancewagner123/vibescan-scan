@@ -15,7 +15,7 @@ report means "none of our 10 known patterns matched" — not "your app is secure
 
 ## Usage
 
-    npx vibescan scan [path]
+    npx vibescan-scan scan [path]
 
 `path` defaults to the current directory. VibeScan will:
 
@@ -28,3 +28,15 @@ report means "none of our 10 known patterns matched" — not "your app is secure
 
 Every suggested fix is a **diff to review, not a change VibeScan applies for you** — see
 "Suggested fixes are suggestions, not verified patches" in `SECURITY_SCOPE.md`.
+
+### CI gating with `--fail-on`
+
+By default `vibescan scan` always exits `0`, even when it finds issues — it's a report,
+not a gate, unless you opt in. Add `--fail-on <severity>` to make it exit non-zero when
+any finding is at or above that severity, so a CI job can fail the build on it:
+
+    npx vibescan-scan scan . --fail-on critical
+
+Severity ranking, most to least severe: `critical > high > medium > low`. `--fail-on high`
+fails on critical or high findings, `--fail-on low` fails on any finding at all. Omitting
+`--fail-on` entirely preserves the always-exit-0 behavior.

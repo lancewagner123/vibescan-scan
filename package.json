@@ -1,7 +1,7 @@
 {
-  "name": "vibescan",
+  "name": "vibescan-scan",
   "version": "0.1.0",
-  "license": "UNLICENSED",
+  "license": "MIT",
   "description": "Security scanning for people who didn't write their own code.",
   "type": "commonjs",
   "bin": {

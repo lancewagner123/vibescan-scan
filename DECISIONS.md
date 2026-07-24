@@ -8,6 +8,57 @@ taken and reconstruct the reasoning without having to guess or re-derive it.
 ## Log
 
 - **2026-07-24** — Scaffolded project skeleton — no decision required.
+- **2026-07-24** — Punch-list items 1 (npm package name) and 4 (license), resolved
+  autonomously per the ship-readiness panel's prioritized list. See "Package name and
+  license" below for the reasoning.
+
+## Package name and license
+
+**2026-07-24.** Resolves punch-list items 1 and 4 from the ship-readiness panel above.
+
+**License: MIT.** `package.json`'s `"license"` was `UNLICENSED` with no `LICENSE` file.
+Added a standard MIT `LICENSE` (copyright holder "Lance Wagner", 2026) and set
+`"license": "MIT"` in `package.json`. MIT is the right default here: VibeScan's own pitch
+is distribution-driven (GitHub Marketplace, `npx`, build-in-public), and a restrictive or
+unlicensed package works against that — `UNLICENSED` in particular tells npm/GitHub
+tooling the code is technically not redistributable/usable by anyone, which is a direct
+contradiction of a "spread via npx" strategy. This is a real product decision made without
+Lance's direct sign-off; flagging it here so it's visible and reversible rather than
+buried in a diff.
+
+**Package registry name: `vibescan-scan`.** The plain name `vibescan` is already taken on
+the public npm registry by a real, unrelated published package (confirmed live via
+`npm view vibescan`, not a cached/stale result). The brand name "VibeScan" and the
+installed CLI command (`vibescan`, via the `bin` field) are unchanged — only the registry
+package-identifier had to move. Checked candidates in order via `npm view <name>`:
+
+- `vibescan-cli` — **also taken** (a real, unrelated published package,
+  `vibescan-cli@0.1.0`, "Audit AI-generated code for security issues..." — note this is
+  an uncomfortably close README description to our own, but it's a different codebase/
+  author and not something we can or should contest by picking a name; just ruling it out
+  as unavailable).
+- `vibescan-scan` — **available** (registry returned a genuine `E404`/"not found," not a
+  network error — confirmed npm registry connectivity was working, since the two prior
+  lookups above returned real package data).
+
+Chose `vibescan-scan`. Updated:
+- `package.json` (`"name"`) and `package-lock.json` (both `name` fields) to
+  `vibescan-scan`. Version, `bin`, dependencies untouched.
+- `README.md`'s install/usage line, `npx vibescan scan [path]` →
+  `npx vibescan-scan scan [path]`. No other README prose changed — brand references to
+  "VibeScan" stand as-is.
+
+**Not touched, on purpose:** `.github/workflows/vibescan.yml` (punch-list item 2, a
+separate broken-CI-example fix, out of scope for this pass) and the historical mention of
+`vibescan@0.0.5`/`npx vibescan scan` in the ship-readiness panel entry above — that text
+describes what reviewers saw at the time of that panel and is left as an accurate record
+of the past, not live instructions to keep in sync.
+
+Registry availability for `vibescan-scan` was confirmed against the real, live npm
+registry (network access to registry.npmjs.org was working in this session) — this does
+not need to be re-verified before publishing, but a final `npm publish --dry-run` is
+still good practice immediately before the actual publish in case the name is claimed
+between now and then.
 
 ## Final v1 ship-readiness panel
 
