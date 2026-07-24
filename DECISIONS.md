@@ -441,3 +441,87 @@ decisions, not correctness bugs, and are reasonable to leave for whenever this s
 real users rather than fix reflexively now.
 
 `npm test`: 22/22 passing. Committed on top of a clean tree.
+
+## Round-2 deep testing: checks 11-15, then all 15 together (2026-07-24)
+
+A full second-round testing cycle: first an adversarial deep-dive on checks 11-15 alone
+(three independent testers — an evasion hunter, a false-positive hunter, and a
+realistic-library tester exercising real Mongoose/Sequelize/Prisma/Express call shapes),
+then a follow-up pass across all 15 checks together (checks 1-10 included) to catch any
+interaction or regression the checks-11-15-only pass might have missed in isolation.
+
+**What was tested:** every finding from all three round-2 reports against checks 11-15 (14
+evasion gaps, 3 false-positive gaps, 4 realistic-library gaps) plus the follow-up
+all-15-checks sweep, triaged directly against `src/scanners/{secrets.js,static-checks.js,
+util.js}` rather than taken on faith.
+
+**Real bugs found and fixed (25 total, all with regression tests):**
+- **Checks 11-15 (20 fixes):** shared-helper gaps in `util.js` (async-arrow and
+  TypeScript-return-type helper resolution, class-static-method dispatch, multi-line
+  return-expression extraction, class-static-field resolution) that fed forward into
+  check 11 (bracket-key template literals, computed `crypto['createHash']`,
+  static-method/async-arrow token generators, static-field hash algorithms), check 13
+  (bracket `req['body']` access, plain/renamed/nested destructuring, Mongoose
+  `findByIdAndUpdate`-family calls, Prisma's `{ data: req.body }` shape), check 14
+  (paren-wrapped arrow object literals), and check 15 (optional chaining/nullish
+  coalescing, template-literal targets, awaited helper calls, the `new URL(...)`
+  base-argument redirect bypass). Plus 5 false-positive fixes: `secure:`
+  NODE_ENV-conditional cookies, inline-call cookie-options resolution, the
+  `author`/`auth` substring collision, `new URL` + `.origin` redirect guards, and
+  non-prefixed allowlist array names — and a `tokenizerSeed`-style token-keyword false
+  positive fixed via a JS-side boundary post-filter (a naive regex lookahead was found to
+  be actively wrong under the pattern's own `i` flag).
+- **Checks 1-10 (2 fixes), found by the all-15 follow-up pass:**
+  1. **Check 7 (`missing-auth-middleware`) camelCase false positive** —
+     `AUTH_KEYWORD_AS_ARG_RE` inherited a `\b` word-boundary anchor from
+     `AUTH_KEYWORD_RE`, so idiomatic camelCase middleware names (`requireAuth`,
+     `checkAuth` — "Auth" starting mid-identifier, not at a word boundary) were invisible
+     to the inline-argument, concat-path, and chained-route auth checks, causing real
+     middleware to be reported as missing. Fixed by extracting a shared, unanchored
+     `AUTH_KEYWORD_VOCAB` both regexes now build from, mirroring the precedent already
+     set by `AUTH_MIDDLEWARE_NAME_RE`.
+  2. **Check 9 (`stripe-webhook-unverified`) imprecise anchor** — both the
+     no-`constructEvent` and `constructEvent`-present-but-unenforced code paths anchored
+     their finding to the first `/webhook/i` substring match anywhere in the file (which
+     could land on unrelated code, e.g. a `webhook_events` SQL table name), causing
+     visual collision with unrelated findings on the same line. Fixed by anchoring to the
+     actual `req.body`/`request.body` or `constructEvent`/fallback match that drives each
+     finding.
+
+**Documented as accepted limitations instead of force-fixed:**
+- Check 11: `secretIngredient`/`gameToken`/`animationToken` — syntactically identical to
+  real token names at a genuine camelCase segment boundary; no regex/boundary heuristic
+  can distinguish them without semantic understanding of the code.
+- Check 12: a password-hashing check's route-path/file-path collision (an unrelated
+  `createHash('md5')` call flagged because "password" appears incidentally nearby, or
+  because the file lives under an auth-ish path) — a deliberate recall-over-precision
+  tradeoff, not worth chasing with more context-window tightening.
+- Check 13: mass-assignment's lack of model-schema awareness (a call flagged even when
+  the target model has no privileged fields to smuggle in) — inherent to a
+  regex/text-based scanner with no access to the actual schema definition.
+- Check 9: a borderline false positive where a fake bcrypt-shaped password *hash* trips
+  the unrelated `secret-hardcoded-generic` generic-entropy heuristic — same category as
+  the already-documented substring/entropy tradeoffs above.
+
+**Before/after test count:** 22/22 passing at the start of this round → **48/48 passing**
+at the end (20 new regression tests for the checks-11-15 gaps/false-positives, plus 1 new
+regression test for the check 7 camelCase fix). Independently re-run and confirmed, not
+just taken from agent reports.
+
+**Independent verification performed directly (not trusting prior session reports):**
+`npm test` re-run clean at 48/48; `git log`/`git status` confirmed a clean tree with 5
+logical commits for the checks-11-15 pass; `bin/vibescan.js scan` re-run against
+`test/fixtures/vulnerable-demo-app` and all 15 original `checkId`s confirmed present in
+the raw JSON output; every new fixture/test file inventoried directly from the filesystem
+(`test/fixtures/evasion-attempts/17-round2-new-evasions/` — 17 files,
+`test/fixtures/evasion-attempts/18-realistic-library-gaps/` — 4 files,
+`test/fixtures/regression-samples/inline-camelcase-auth-arg.js`,
+`test/false-positives.test.js`, and `test/fixtures/synthetic-realistic-app/`).
+
+**Confidence assessment after this round:** checks 1-10 — high; both bugs found were
+narrow anchor/word-boundary issues in already-solid detection logic, not shape-level
+gaps, and this round specifically added a cross-check pass they hadn't had before. Checks
+11-15 — moderate-to-high; two independent adversarial rounds (red-team + evasion/FP/
+library-realism) have now been run against them versus one for 1-10, and the remaining
+open items are all documented, judgment-dependent tradeoffs rather than known-exploitable
+blind spots, but they are newer code with less real-world mileage than 1-10.
