@@ -12,3 +12,16 @@
 10. vulnerable-dependency — npm audit (or pip-audit if present) reports a known CVE at high/critical severity.
 
 Each check has a stable checkId matching the number prefix above, e.g. "secret-hardcoded-generic", "sql-string-concatenation", etc. Non-goals (do not attempt in v1, and say so explicitly in SECURITY_SCOPE.md): no DAST/runtime fuzzing, no business-logic vulnerability detection, no compliance/regulatory coverage claims, no auto-merge of any fix (fixes are suggestions/diffs only, never auto-applied).
+
+## Severity ranking
+
+Every triaged finding carries one of four severities: `critical`, `high`, `medium`, `low`
+(see the Triage Output Schema in `docs/FINDINGS_SCHEMA.md`). Ranked most to least severe:
+
+    critical > high > medium > low
+
+This is the same rank order enforced internally by `src/triage/triage.js`'s
+`SEVERITY_RANK` / `reconcileWithSource` (which recomputes and overwrites each finding's
+severity from its source checks rather than trusting the model's stated severity), and it
+is the ranking `vibescan scan --fail-on <severity>` uses to decide whether to exit
+non-zero — see the README's "CI gating with `--fail-on`" section.
