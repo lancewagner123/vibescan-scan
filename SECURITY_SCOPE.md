@@ -678,6 +678,36 @@ carry the same confidence" section (rewritten alongside this entry) and
 `DECISIONS.md`'s "Real-world false-positive validation" entry for the full reasoning and the
 ship/no-ship call this data supports.
 
+**Update (2026-07-24, later same day) — the four concrete bugs below are now fixed, not open
+issues.** The paragraphs above are left as the historical record of what the validation
+exercise found; this note is the current status:
+
+1. **Supabase anon-key false positive** (the majority of the 45 secret-check false
+   positives above) — `secrets.js` now decodes JWT-shaped candidate values and suppresses the
+   finding when the payload's `role` claim is `anon`/`anonymous`; a `service_role` JWT still
+   flags. Fixed in commit `5fa05b5`, regression-tested in
+   `test/fixtures/false-positives/23-real-world-secrets/`.
+2. **Env-var-reference false positive** (variable *names* containing "key"/"secret" whose
+   value is a `process.env.X`/`import.meta.env.X` reference, not a literal) — `secrets.js` now
+   rejects pure dotted-identifier/property-access values before the entropy check runs. Fixed
+   in commit `5fa05b5`, same fixture folder as above.
+3. **`RegExp.prototype.exec()` mistaken for `child_process.exec()`** — `checkEvalOnInput()`
+   now traces each `exec`/`execSync` call site's actual receiver instead of checking whether
+   the whole file merely mentions `child_process`, so a `.exec()` regex call in a file that
+   separately imports `child_process` for something unrelated no longer fires. Fixed in commit
+   `77da59b` (code in `0904054`), regression-tested in
+   `test/fixtures/false-positives/5-eval-on-input/`.
+4. **`supabase-rls-disabled` never scanning `.sql` migration files** (the genuine miss noted
+   above) — check 8 now runs a dedicated `.sql`-file pass that parses `CREATE POLICY` bodies
+   and flags `anon`/`public` grants with `USING (true)` or no `USING` clause. Fixed in commit
+   `0904054`, regression-tested in
+   `test/fixtures/evasion-attempts/23-supabase-rls-sql/`.
+
+All four were re-verified the same day both via `npm test` (91/91 passing) and by hand against
+fresh, non-fixture synthetic reproductions run through the real CLI — see
+`docs/REAL_WORLD_VALIDATION.md`'s "Fix status" section for the detailed writeup and hand-run
+results.
+
 ## Why this file exists
 
 This tool is aimed at people who did not write their own code and may not have the

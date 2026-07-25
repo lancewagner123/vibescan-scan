@@ -191,6 +191,8 @@ since discussing "repo X's leaked key" in a public doc reads badly regardless of
 Findings about missing-auth or `eval`-on-input structure are cited by real (already-public)
 repo name, since there's nothing sensitive in naming which repo has an unauthenticated route.
 
+**FIXED (2026-07-24, same day) — see "Fix status" note at the end of this document.**
+
 **1. The Supabase "anon key" pattern (the single largest false-positive source, ~14 of 45).**
 Across multiple independently-sourced Lovable/Bolt/Supabase-stack repos (e.g. "Repo A —
 Lovable-built plant-diagnosis app," "Repo B — Bolt-built Supabase reservation app," "Repo C —
@@ -203,7 +205,8 @@ string secret. One repo's fallback default in a test file resolved to Supabase's
 published public demo/quickstart key, verbatim, from their docs. None of these findings
 involved a genuinely dangerous `service_role` key.
 
-**2. Env-var references, not literal secrets.** Several `secret-hardcoded-generic` hits
+**2. Env-var references, not literal secrets. FIXED (2026-07-24) — see "Fix status" note below.**
+Several `secret-hardcoded-generic` hits
 were lines like `const KEY = import.meta.env.VITE_SUPABASE_KEY` or
 `os.getenv("PINECONE_API_KEY")` — a variable *name* containing "key"/"secret", with no
 literal value on the line at all. The heuristic matched the name pattern, not actual
@@ -214,7 +217,8 @@ entropy/content.
 `*.test.mjs` files — literal fixture data written specifically to exercise a key-parsing
 function's validation logic, never a real credential.
 
-**4. `RegExp.prototype.exec()` mistaken for code execution.** All 7 `eval-on-input`
+**4. `RegExp.prototype.exec()` mistaken for code execution. FIXED (2026-07-24) — see "Fix
+status" note below.** All 7 `eval-on-input`
 false positives were regex `.exec()` calls (extracting a leading number from a filename,
 validating a plugin name against an allowlist, scanning source text for a call signature) —
 not `eval()`, `Function()`, or a shell exec call at all. The checkId's own heuristic appears
@@ -266,7 +270,8 @@ code, not a fixture:
   cookies client-side in that app, not just sitting unused in `node_modules`.
 
 **A genuine miss worth recording honestly, even though it isn't one of the 253 triaged
-findings:** while manually reading a Bolt.new-built reservation app's Supabase migration
+findings — FIXED (2026-07-24), see "Fix status" note below:** while manually reading a
+Bolt.new-built reservation app's Supabase migration
 (to triage its dependency findings), the person triaging found an actual, real
 `supabase-rls-disabled`-shaped bug VibeScan's own check-8 never flagged — a migration
 granting the public `anon` role unrestricted `SELECT ... USING (true)` on a reservations
@@ -296,3 +301,62 @@ sample was the actual failure mode.
   for six of those ten checks. See the `SECURITY_SCOPE.md`/`README.md` updates made alongside
   this document, and `DECISIONS.md`'s "Real-world false-positive validation" entry for the
   ship/no-ship call.
+
+## Fix status (2026-07-24, later same day)
+
+Four of the specific bugs this exercise surfaced have since been fixed and regression-tested;
+they are **no longer open issues**. This section is the current status — the narrative above
+(§5, §6) is left intact as the historical record of what the validation exercise actually
+found, with inline "FIXED" markers pointing here.
+
+1. **Supabase anon-key false positive (§5, pattern 1).** `src/scanners/secrets.js` now
+   decodes the payload of any JWT-shaped candidate value and suppresses the finding when the
+   `role` claim is `anon`/`anonymous`, across every hit path (single-line vendor patterns,
+   quoted/unquoted/bracket generic-entropy, template-literal-split, concat-chain,
+   base64-decode). A `service_role` JWT, or any JWT whose payload fails to decode, still
+   flags normally. Fixed in commit `5fa05b5`. Regression coverage:
+   `test/fixtures/false-positives/23-real-world-secrets/`, run via
+   `test/false-positives.test.js`. Hand-reconstructed with a fresh (non-fixture) synthetic
+   anon-role JWT during integration verification the same day — did not fire — and a
+   fresh synthetic `service_role` JWT — still fired at `critical`.
+
+2. **Env-var-reference false positive (§5, pattern 2).** `secrets.js` now rejects candidate
+   values that are pure dotted identifier/property-access chains (`import.meta.env.X`,
+   `process.env.X`, `config.apiKey`, etc.) before the entropy check ever runs, across the
+   quoted, unquoted-dotenv-shape, and bracket-notation generic-secret paths. Fixed in commit
+   `5fa05b5`. Regression coverage: `test/fixtures/false-positives/23-real-world-secrets/`
+   (`env-var-reference.js`). Hand-reconstructed the same day with a fresh `import.meta.env`
+   reference and a fresh unquoted `KEY = import.meta.env.X` dotenv-shape line — neither fired.
+
+3. **`RegExp.prototype.exec()` false positive (§5, pattern 4).** `checkEvalOnInput()` in
+   `src/scanners/static-checks.js` no longer gates on whether the *whole file* mentions
+   `child_process` — it now traces each `exec`/`execSync` call site's actual receiver (bare
+   destructured import, one-hop-traced variable, or inline `require('child_process').exec()`)
+   and only flags calls that genuinely resolve to `child_process`. A `RegExp.prototype.exec()`
+   call sitting in a file that separately imports `child_process` for an unrelated purpose no
+   longer fires. Fixed in commit `77da59b` (code change landed in `0904054`, tests/fixtures in
+   `77da59b`). Regression coverage: `test/fixtures/false-positives/5-eval-on-input/`. Hand-
+   reconstructed the same day with a filename-number-extractor using `.exec()` alongside an
+   unrelated `child_process.execSync()` call in the same file — did not fire — while a real
+   `child_process.exec()` call with interpolated request input in a separate fixture still
+   fired at `critical`.
+
+4. **`supabase-rls-disabled` missing `.sql` migration coverage (§6, the genuine miss).**
+   `static-checks.js` now runs a dedicated `.sql`-file scan pass alongside the existing JS/TS
+   pass: it strips SQL comments, parses `CREATE POLICY ... ON <table> ... TO <roles> ...`
+   statements, and flags a policy that grants `anon`/`public` with `USING (true)` or no
+   `USING` clause at all (for non-INSERT operations) — while staying silent on policies scoped
+   with a real condition like `USING (auth.uid() = user_id)`. The existing `ALTER TABLE ...
+   DISABLE ROW LEVEL SECURITY` pattern is now also reachable against `.sql` files, since it
+   previously had no `.sql` pass to run in at all. Fixed in commit `0904054`. Regression
+   coverage: `test/fixtures/evasion-attempts/23-supabase-rls-sql/`. Hand-reconstructed the
+   same day with a fresh synthetic reservations-table migration
+   (`create policy ... on reservations for select to anon using (true)`) — fired at
+   `critical` with the correct table/policy named in the finding message.
+
+**Verification method:** all four fixes were confirmed via the project's automated test suite
+(`npm test`, 91/91 passing) *and* independently, by hand, against fresh synthetic
+reproductions built from the descriptions above (not the checked-in regression fixtures) using
+the real CLI/`scanRepo()` — a fresh anon-role JWT, a fresh env-var-reference assignment, a
+fresh filename-number-extractor sharing a file with an unrelated `child_process` import, and a
+fresh permissive-RLS-policy `.sql` migration, each producing the expected fire/no-fire result.
