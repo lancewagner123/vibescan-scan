@@ -402,6 +402,58 @@ test('evasion-attempts/21-round3-authz-webhook/07-admin-array-single-middleware.
   assert.equal(hits.length, 0, `expected zero missing-auth-middleware findings -- the single-element middleware-array fix may have regressed. Found: ${JSON.stringify(hits)}`);
 });
 
+// --- Round 3 dependency-check (check 10) fixes ----------------------------------------
+// These are unit-level assertions on dependencies.js internals rather than scanRepo() runs,
+// because the full check-10 path needs npm + live network (too flaky to gate CI on). The
+// scenario-6 id-collision fix and the defect-B warning-attribution fix are both pure
+// functions of their inputs, so they're tested directly.
+const { parseNpmAuditJson, describeInstallFailure } = require('../src/scanners/dependencies');
+
+test('dependencies.js scenario 6: the same CVE in two different package.json files gets DISTINCT finding ids', () => {
+  // Minimal npm-audit-shaped JSON with one high-severity advisory.
+  const auditJson = JSON.stringify({
+    vulnerabilities: {
+      lodash: { severity: 'high', range: '<4.17.21', via: [{ title: 'Prototype Pollution in lodash' }] },
+    },
+  });
+  const warnings = [];
+  const rootFindings = parseNpmAuditJson(auditJson, warnings, 'package.json');
+  const nestedFindings = parseNpmAuditJson(auditJson, warnings, 'packages/api/package.json');
+
+  assert.equal(rootFindings.length, 1);
+  assert.equal(nestedFindings.length, 1);
+  assert.equal(rootFindings[0].file, 'package.json');
+  assert.equal(nestedFindings[0].file, 'packages/api/package.json');
+  assert.notEqual(
+    rootFindings[0].id,
+    nestedFindings[0].id,
+    'the same CVE in two different package.json files must get distinct ids -- makeId omitting the file (scenario 6) would collide them'
+  );
+});
+
+test('dependencies.js defect B: temp-install failure warning attributes the actual cause, not a hardcoded "no network access"', () => {
+  assert.match(
+    describeInstallFailure({ stderr: 'npm error code EUNSUPPORTEDPROTOCOL\nnpm error Unsupported URL Type "workspace:": workspace:*' }),
+    /workspace/i,
+    'a workspace:-protocol failure must be attributed to the workspace protocol, not to network access'
+  );
+  assert.match(
+    describeInstallFailure({ stderr: "npm error code E404\nnpm error 404 '@turbo/shared@*' is not in this registry" }),
+    /not published|registry/i,
+    'an unpublished internal-dep 404 must be attributed to an unpublished dependency, not to network access'
+  );
+  assert.match(
+    describeInstallFailure({ stderr: 'npm error network getaddrinfo ENOTFOUND registry.npmjs.org' }),
+    /network/i,
+    'a genuine network failure should still say network'
+  );
+  assert.match(
+    describeInstallFailure({ stderr: '' }),
+    /unknown/i,
+    'an unclassifiable failure must say the cause is unknown, not assert a specific one'
+  );
+});
+
 test('prompt-injection-variants: buildUserMessage() neutralizes every reachable injected tag/instruction', async () => {
   const findings = await scanRepo(PROMPT_INJECTION_ROOT);
   assert.ok(Array.isArray(findings), 'scanRepo() must resolve to an array of raw findings');

@@ -22,6 +22,13 @@ const NPM_SEVERITIES_TO_REPORT = new Set(['high', 'critical']);
 // otherwise open a command-injection surface via argument string-building).
 const NPM_BIN = process.platform === 'win32' ? 'npm.cmd' : 'npm';
 
+// Upper bound on any single npm/pip child process. Without it, a stalled `npm install`/
+// `npm audit` on the temp-install path (slow/flaky network, huge cold-cache monorepo, a
+// private-registry auth prompt) blocks the ENTIRE scan indefinitely (round-3 dependency
+// stress-test, scenario 7). execFileSync throws ETIMEDOUT past this, which degrades to a
+// warning like any other failure rather than hanging.
+const CHILD_PROCESS_TIMEOUT_MS = 120000;
+
 function runCaptureJson(cmd, args, cwd, maxBuffer, opts = {}) {
   // npm audit / pip-audit both exit non-zero when vulnerabilities are found — that's
   // normal, not a failure. execFileSync throws on non-zero exit, so on throw we still
@@ -33,6 +40,13 @@ function runCaptureJson(cmd, args, cwd, maxBuffer, opts = {}) {
       maxBuffer,
       windowsHide: true,
       shell: !!opts.shell,
+      // Capture stderr into the result (fd 2 = 'pipe') instead of letting execFileSync's
+      // default 'inherit' splatter raw `npm error 404 ...`/`EUNSUPPORTEDPROTOCOL ...` spew
+      // straight onto the user's terminal (round-3 dependency stress-test, defect A) --
+      // alarming, unactionable noise for a non-technical user on any monorepo/offline run.
+      // The captured stderr is still available on err.stderr for the warning-wording logic.
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: opts.timeout || CHILD_PROCESS_TIMEOUT_MS,
     });
     return { ok: true, raw: out, err: null };
   } catch (err) {
@@ -41,6 +55,30 @@ function runCaptureJson(cmd, args, cwd, maxBuffer, opts = {}) {
     }
     return { ok: false, raw: null, err };
   }
+}
+
+// The temp-install path can fail for several very different reasons that each need a
+// different remediation -- the old hardcoded "(likely no network access)" message
+// misattributed all of them to one cause (round-3 dependency stress-test, defect B).
+// Inspect the captured stderr to name the actual cause when we can tell.
+function describeInstallFailure(err) {
+  const stderr = (err && typeof err.stderr === 'string') ? err.stderr : '';
+  if (err && (err.signal === 'SIGTERM' || err.code === 'ETIMEDOUT')) {
+    return 'the operation timed out';
+  }
+  if (/EUNSUPPORTEDPROTOCOL|workspace:/i.test(stderr)) {
+    return 'the package uses a workspace:/internal dependency protocol that npm cannot resolve for an isolated audit (common in pnpm/yarn/Turborepo/Nx monorepos)';
+  }
+  if (/E404|not in this registry/i.test(stderr)) {
+    return 'it references a dependency not published to the registry (e.g. an internal/workspace package resolved in isolation)';
+  }
+  if (/ENOTFOUND|ETIMEDOUT|EAI_AGAIN|network|getaddrinfo/i.test(stderr)) {
+    return 'the registry could not be reached (likely no network access)';
+  }
+  if (/JSON|Unexpected|parse|EJSONPARSE/i.test(stderr)) {
+    return 'the package.json could not be parsed (malformed manifest)';
+  }
+  return 'the cause is unknown (could be no network access, an unpublished/workspace dependency, or a malformed package.json)';
 }
 
 function isCommandNotFound(err) {
@@ -59,7 +97,7 @@ function extractAdvisoryTitles(via) {
     .filter(Boolean);
 }
 
-function parseNpmAuditJson(raw, warnings) {
+function parseNpmAuditJson(raw, warnings, fileForId) {
   let parsed;
   try {
     parsed = JSON.parse(raw);
@@ -80,11 +118,16 @@ function parseNpmAuditJson(raw, warnings) {
     const titleText = titles.length ? titles.join('; ') : `${pkgName} has a known ${severity} severity vulnerability`;
 
     findings.push({
-      id: makeId(CHECK_ID, [pkgName, rangeStr, severity]),
+      // `fileForId` (the package.json's repo-relative path) is part of the id so the SAME
+      // CVE reported against two different package.json files in a workspace produces two
+      // DISTINCT ids -- omitting it made both collide on one id (round-3 dependency
+      // stress-test, scenario 6), contradicting makeId's own "parts that identify *this*
+      // occurrence (file, line...)" contract and double-counting under heuristic triage.
+      id: makeId(CHECK_ID, [fileForId, pkgName, rangeStr, severity]),
       checkId: CHECK_ID,
       severity,
       category: 'dependency',
-      file: 'package.json',
+      file: fileForId,
       line: null,
       snippet: `${pkgName}@${rangeStr}`.slice(0, 200),
       rawMessage: `npm audit: ${titleText} (package "${pkgName}", vulnerable range ${rangeStr}, severity ${severity}).`,
@@ -118,7 +161,6 @@ function findNestedPackageJsonDirs(repoPath) {
 function scanNpmAuditForPackageDir(pkgDir, repoPath, warnings) {
   const packageJsonPath = path.join(pkgDir, 'package.json');
   const repoRelPackageJson = path.relative(repoPath, packageJsonPath).split(path.sep).join('/');
-  const attachFile = (findings) => findings.map((f) => ({ ...f, file: repoRelPackageJson }));
 
   const hasLockfile = LOCKFILE_NAMES.some((name) => fs.existsSync(path.join(pkgDir, name)));
 
@@ -134,7 +176,7 @@ function scanNpmAuditForPackageDir(pkgDir, repoPath, warnings) {
       }
       return [];
     }
-    return attachFile(parseNpmAuditJson(result.raw, warnings));
+    return parseNpmAuditJson(result.raw, warnings, repoRelPackageJson);
   }
 
   // No lockfile committed (common for a freshly-scaffolded/AI-generated project that
@@ -159,7 +201,7 @@ function scanNpmAuditForPackageDir(pkgDir, repoPath, warnings) {
       if (isCommandNotFound(installResult.err)) {
         warnings.push('dependencies.js: npm is not available on PATH — skipped npm audit (check 10 for JS deps).');
       } else {
-        warnings.push(`dependencies.js: no lockfile for ${repoRelPackageJson}, and generating a temporary one failed (likely no network access) — skipped npm audit for this package.`);
+        warnings.push(`dependencies.js: no lockfile for ${repoRelPackageJson}, and generating a temporary one failed — ${describeInstallFailure(installResult.err)}. Skipped npm audit for this package.`);
       }
       return [];
     }
@@ -169,7 +211,7 @@ function scanNpmAuditForPackageDir(pkgDir, repoPath, warnings) {
       warnings.push(`dependencies.js: npm audit failed to run against generated lockfile for ${repoRelPackageJson}: ${auditResult.err ? auditResult.err.message : 'unknown error'}`);
       return [];
     }
-    return attachFile(parseNpmAuditJson(auditResult.raw, warnings));
+    return parseNpmAuditJson(auditResult.raw, warnings, repoRelPackageJson);
   } catch (err) {
     warnings.push(`dependencies.js: could not audit ${repoRelPackageJson} without a committed lockfile: ${err.message}`);
     return [];
@@ -287,4 +329,7 @@ function scan(repoPath, opts = {}) {
   return { findings, warnings };
 }
 
-module.exports = { scan };
+// parseNpmAuditJson and describeInstallFailure are exported for deterministic, network-free
+// regression tests (the scenario-6 id-collision fix and the defect-B warning-attribution
+// fix) -- the full scan path needs npm + network, which is too flaky to assert on directly.
+module.exports = { scan, parseNpmAuditJson, describeInstallFailure };
