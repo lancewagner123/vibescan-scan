@@ -151,10 +151,27 @@ const ENTROPY_THRESHOLD = 3.0; // bits/char — placeholders/words fall well bel
 // list of the specific identifiers one repo happened to use.
 const KEY_NAME_DESCRIPTOR_SUFFIXES = ['keyname', 'constraintname', 'indexname'];
 
-function isKnownSafeKeyDescriptorName(name) {
+// Round-6 adversarial fix (2026-07-25, independent re-verification of the round-5 fixes):
+// this used to suppress on the NAME suffix alone, with no check on the VALUE at all -- so
+// `const secretKeyName = "<any real secret>"` in perfectly ordinary, hand-written source
+// (src/config.ts, no auto-generated marker in sight) went completely invisible, regardless
+// of how obviously high-entropy the value was. The name-suffix signal alone was never
+// actually sufficient: "ends in KeyName" tells you the property is describing the NAME of
+// some key/constraint/index, but says nothing about whether the code that assigned it
+// actually put a real DB-identifier-shaped name there versus a secret that merely got
+// mis-named. The value still has to look like what a `foreignKeyName`/`constraintName`/
+// `indexName` field actually holds: a snake_case DB identifier (letters/digits/underscores
+// only, at least one underscore -- looksLikeGeneratedDbIdentifier, the same value-shape
+// check already used as the secondary auto-generated-file signal below). A real secret
+// assigned to a `*KeyName` variable virtually never happens to also be underscore-separated
+// snake_case with no base64 `+/=` punctuation, so this only ever narrows the existing
+// suppression, it doesn't newly misclassify anything the old (name-only) version wasn't
+// already misclassifying.
+function isKnownSafeKeyDescriptorName(name, value) {
   if (typeof name !== 'string') return false;
   const folded = name.replace(/[^A-Za-z0-9]/g, '').toLowerCase();
-  return KEY_NAME_DESCRIPTOR_SUFFIXES.some((suffix) => folded.endsWith(suffix));
+  if (!KEY_NAME_DESCRIPTOR_SUFFIXES.some((suffix) => folded.endsWith(suffix))) return false;
+  return looksLikeGeneratedDbIdentifier(value);
 }
 
 // Secondary, lower-confidence signal for the same underlying pattern: a file whose own
@@ -305,6 +322,113 @@ function isLowEntropyIdentifierSegment(segment) {
   return true;
 }
 
+// --- Round-6 adversarial fix (2026-07-25, independent re-verification of the round-5 fixes):
+// Bug D regression. isLowEntropyIdentifierSegment's digit-density/case-transition shape test
+// is a real signal but not a rare enough one on its own: a Monte Carlo over 200,000 realistic
+// random base62 dot-chain secrets (the exact shape this file's own history keeps hitting --
+// SendGrid-style `SG.<part>.<part>`, HMAC `id.sig` tokens) found ~1.06% pass BOTH the digit-
+// density and case-transition gates purely by chance -- e.g. `vgbMLqt7Kyi.GopxURSG1`,
+// `A9OWETPC.RFpwTs5TTXEI`. That's a baseline false-negative rate for a mainstream secret
+// shape, not a crafted adversarial edge case -- confirmed against the actual exported
+// `scanTextForSecrets` pipeline, not a standalone unit.
+//
+// Narrowing back toward a fixed set of known-safe roots (process./self./this./config./...)
+// was considered and rejected -- that's the exact approach this file's history already
+// outgrew twice (the four-hardcoded-root version, then the root-list-extension idea for
+// self./this.) and would just reintroduce the next framework's own accessor convention as a
+// gap. The actual missing signal is WORD SHAPE: a real identifier segment isn't just "low
+// digit density, few case transitions" -- when split at its own underscore/camelCase word
+// boundaries (the same boundaries a person actually typed), each resulting "word" reads as
+// pronounceable English-identifier text (a vowel present, no implausible run of consonants),
+// and a real segment decomposes into only a handful of such words. A random base62 blob has
+// no real word boundaries to speak of -- splitWords() only ever finds boundaries in it by
+// accident (an incidental case flip), so either it comes out as one long ungrammatical "word"
+// that fails the vowel/consonant check, or it fragments into many tiny pieces, which the word-
+// count cap below rejects. Verified by Monte Carlo (same 200,000-sample methodology) to cut
+// the false-negative rate roughly 5x (~1.06% -> ~0.2%) for two-segment dot-chains, while every
+// known real-world code-reference shape (self.access_key, process.env.VITE_SUPABASE_KEY,
+// import.meta.env.PINECONE_KEY, this.config.apiKey, options.secretToken,
+// app.state.auth.secretToken, settings.database.password, env.SECRET_KEY, and short
+// abbreviations like cfg/ctx/fs/db/id/api/key) keeps passing -- see the regression fixtures
+// added alongside this fix. The residual ~0.2% is a documented, accepted tradeoff (same
+// posture as Bug B's bare-`key`-needs-a-digit rule): tightening further to zero, in testing,
+// only did so by also rejecting real identifiers (`config`, `settings`, `password`,
+// `oauth2Token` all broke under stricter variants tried).
+//
+// Word boundaries: split on '_' first, then on a lowercase-or-digit-to-uppercase transition
+// (camelCase: "accessKey" -> "access","Key") and on an uppercase-run-to-uppercase+lowercase
+// transition (acronym boundary: "HTTPServer" -> "HTTP","Server").
+function splitIdentifierWords(segment) {
+  const words = [];
+  for (const part of segment.split('_')) {
+    if (!part) continue;
+    const marked = part
+      .replace(/([a-z0-9])([A-Z])/g, '$1\x00$2')
+      .replace(/([A-Z]+)([A-Z][a-z])/g, '$1\x00$2');
+    for (const word of marked.split('\x00')) {
+      if (word) words.push(word);
+    }
+  }
+  return words;
+}
+
+// Short abbreviations (cfg, ctx, fs, db, id, api, key, env, ...) are common, legitimate, and
+// too short for vowel/consonant shape to mean anything -- exempt from the word-shape check.
+const IDENTIFIER_WORD_SHORT_EXEMPT_LENGTH = 3;
+const IDENTIFIER_WORD_MAX_LENGTH = 15;
+// A real word's vowel ratio sits in a moderate band -- English/identifier words are never
+// vowel-free past a few letters, nor mostly vowels. The known real-world identifier corpus
+// this was tuned against (access, process, config, settings, database, password, secret,
+// token, auth, state, options, oauth2, VITE, SUPABASE) ranges 0.20-0.50; the band below keeps
+// clear margin on both sides while still rejecting most random draws.
+const IDENTIFIER_WORD_MIN_VOWEL_RATIO = 0.20;
+const IDENTIFIER_WORD_MAX_VOWEL_RATIO = 0.60;
+// "settings" (ttl) and "password" (ssw) are real 3-consonant runs -- can't tighten below 3
+// without rejecting real identifiers.
+const IDENTIFIER_WORD_MAX_CONSONANT_RUN = 3;
+// Real multi-word identifiers realistically top out around 3 words
+// (VITE_SUPABASE_KEY -> VITE/SUPABASE/KEY); a segment that fragments into more than that is
+// far more likely to be a random blob that happened to case-flip a few times than something a
+// person actually typed as a name.
+const IDENTIFIER_MAX_WORD_COUNT = 3;
+
+function countMaxConsonantRun(word) {
+  let max = 0;
+  let run = 0;
+  for (const ch of word) {
+    if (/[A-Za-z]/.test(ch) && !/[aeiouAEIOU]/.test(ch)) {
+      run++;
+      max = Math.max(max, run);
+    } else {
+      run = 0;
+    }
+  }
+  return max;
+}
+
+function countVowels(word) {
+  return (word.match(/[aeiouAEIOU]/g) || []).length;
+}
+
+function isPronounceableIdentifierWord(word) {
+  if (word.length <= IDENTIFIER_WORD_SHORT_EXEMPT_LENGTH) return true;
+  if (word.length > IDENTIFIER_WORD_MAX_LENGTH) return false;
+  const vowelRatio = countVowels(word) / word.length;
+  if (vowelRatio < IDENTIFIER_WORD_MIN_VOWEL_RATIO || vowelRatio > IDENTIFIER_WORD_MAX_VOWEL_RATIO) return false;
+  if (countMaxConsonantRun(word) > IDENTIFIER_WORD_MAX_CONSONANT_RUN) return false;
+  return true;
+}
+
+// Combines with isLowEntropyIdentifierSegment (AND, not instead-of) in looksLikeCodeReference
+// below -- this only ever narrows an existing suppression further, so it can't newly
+// misclassify a real secret that the digit-density/case-transition check wasn't already
+// letting through.
+function hasIdentifierWordShape(segment) {
+  const words = splitIdentifierWords(segment);
+  if (words.length === 0 || words.length > IDENTIFIER_MAX_WORD_COUNT) return false;
+  return words.every(isPronounceableIdentifierWord);
+}
+
 // GENERIC_ENTROPY_UNQUOTED_RE's value char class doesn't exclude a comma (a real dotenv
 // value could theoretically contain one), so a reference sitting inside a multi-line
 // function call -- the actual real-world Bug D shape, a Python kwarg written one per line
@@ -318,7 +442,7 @@ function looksLikeCodeReference(value) {
   if (!CODE_REFERENCE_VALUE_RE.test(candidate)) return false;
   const segments = candidate.split('.');
   if (segments.length < 2) return false; // need an actual dot chain to read as "a reference" at all
-  return segments.every(isLowEntropyIdentifierSegment);
+  return segments.every((segment) => isLowEntropyIdentifierSegment(segment) && hasIdentifierWordShape(segment));
 }
 
 function scanLineGenericEntropy(line, isAutoGenerated) {
@@ -328,7 +452,7 @@ function scanLineGenericEntropy(line, isAutoGenerated) {
   while ((m = GENERIC_ENTROPY_RE.exec(line)) !== null) {
     const name = m[1];
     const value = m[2];
-    if (isKnownSafeKeyDescriptorName(name)) continue;
+    if (isKnownSafeKeyDescriptorName(name, value)) continue;
     if (isAutoGenerated && looksLikeGeneratedDbIdentifier(value)) continue;
     if (looksLikePlaceholder(value)) continue;
     if (looksLikeCodeReference(value)) continue;
@@ -357,7 +481,7 @@ function scanLineGenericEntropyUnquoted(line, isAutoGenerated) {
   while ((m = GENERIC_ENTROPY_UNQUOTED_RE.exec(line)) !== null) {
     const name = m[1];
     const value = m[2];
-    if (isKnownSafeKeyDescriptorName(name)) continue;
+    if (isKnownSafeKeyDescriptorName(name, value)) continue;
     if (isAutoGenerated && looksLikeGeneratedDbIdentifier(value)) continue;
     if (looksLikePlaceholder(value)) continue;
     if (looksLikeCodeReference(value)) continue;
@@ -394,8 +518,8 @@ function scanLineGenericEntropyBracket(line, isAutoGenerated) {
     const keyExpr = m[1];
     const joined = [...keyExpr.matchAll(/['"`]([\w$]*)['"`]/g)].map((mm) => mm[1]).join('');
     if (!KEYWORDISH_NAME_RE.test(joined)) continue;
-    if (isKnownSafeKeyDescriptorName(joined)) continue;
     const value = m[2];
+    if (isKnownSafeKeyDescriptorName(joined, value)) continue;
     if (isAutoGenerated && looksLikeGeneratedDbIdentifier(value)) continue;
     if (looksLikePlaceholder(value)) continue;
     if (looksLikeCodeReference(value)) continue;

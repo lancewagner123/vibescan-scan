@@ -256,6 +256,21 @@ const POSITIVE_CONTROL_CASES = [
     'secret-hardcoded-generic',
     'Bug D: a real dotted high-entropy secret written in the same trailing-comma kwarg-line shape as the self.access_key fix must still be flagged',
   ],
+  // --- Round-6 adversarial fix (2026-07-25, independent re-verification of the round-5
+  // fixes) -- two REAL regressions found and closed. See src/scanners/secrets.js's inline
+  // comments (search "Round-6 adversarial fix") for the full reasoning behind each.
+  [
+    '25-real-world-secrets-round2',
+    '_control-random-dotted-secret-still-fires.env',
+    'secret-hardcoded-generic',
+    'Bug D regression: ordinary random base62 dot-chain secrets (not maximally digit-dense/case-chaotic) that happened to pass the old per-segment digit-density/case-transition-only shape check must still be flagged',
+  ],
+  [
+    '25-real-world-secrets-round2',
+    '_control-keyname-suffix-real-secret-still-fires.ts',
+    'secret-hardcoded-generic',
+    'Bug A regression: a real secret assigned to a *KeyName-suffixed variable in ordinary, hand-written (non-auto-generated) source must still be flagged -- the name-suffix signal alone was never sufficient without a value-shape check',
+  ],
 ];
 
 for (const [subfolder, filename, checkId, description] of POSITIVE_CONTROL_CASES) {
