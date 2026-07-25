@@ -12,3 +12,6 @@ vibescan-report.json
 # Same reasoning for the synthetic-realistic-app fixture's fake .env (cross-check
 # interaction testing, see its README.md).
 !test/fixtures/synthetic-realistic-app/.env
+
+# Internal reconstruction/reasoning log for this project -- not meant for the public repo.
+docs/field_journal.md
