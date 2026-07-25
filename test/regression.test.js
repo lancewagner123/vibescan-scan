@@ -295,6 +295,52 @@ test('regression-samples/inline-camelcase-auth-arg.js: camelCase inline/concat/c
   );
 });
 
+// --- Round 3 (2026-07-24) -------------------------------------------------------------
+// A third evasion/false-positive pass, this time retrofitting the sophisticated-technique
+// catalog (TS type annotations, bracket/computed access, template-literal splitting,
+// destructured imports, no-semicolon style) onto checks 1-9 (which had never seen it) and
+// taking a fresh look at 11-15. Each fixture below was proven caught/clean via direct
+// scanRepo() output before being wired in here. Fixtures live under
+// test/fixtures/evasion-attempts/{19,20,21,22}-round3-*. Documented (not-fixed) scope
+// limits from this round are recorded in SECURITY_SCOPE.md, NOT asserted here.
+const ROUND3_SECRETS_ROOT = path.join(EVASION_FIXTURES_ROOT, '19-round3-secrets');
+const ROUND3_FRESH_ROOT = path.join(EVASION_FIXTURES_ROOT, '22-round3-fresh-look-11-15');
+let round3SecretsFindings;
+let round3FreshFindings;
+async function round3Secrets() {
+  round3SecretsFindings = round3SecretsFindings || (await scanRepo(ROUND3_SECRETS_ROOT, { skip: ['git-history'] }));
+  return round3SecretsFindings;
+}
+async function round3Fresh() {
+  round3FreshFindings = round3FreshFindings || (await scanRepo(ROUND3_FRESH_ROOT, { skip: ['git-history'] }));
+  return round3FreshFindings;
+}
+
+const ROUND3_SECRETS_CASES = [
+  ['01-ts-type-annotation.ts', 'secret-hardcoded-generic', 'a generic high-entropy secret written with an idiomatic TS type annotation (const apiSecret: string = ...)'],
+  ['02-bracket-notation-key.js', 'secret-hardcoded-generic', 'a generic secret assigned to a bracket-notation / concatenated computed key (config[\'apiSecret\'] = ...)'],
+  ['03-template-literal-split.js', 'secret-hardcoded-generic', 'a known-format secret split with a ${...} template-literal interpolation placeholder'],
+];
+for (const [filename, expectedCheckId, description] of ROUND3_SECRETS_CASES) {
+  test(`evasion-attempts/19-round3-secrets/${filename}: ${expectedCheckId} still caught (${description})`, async () => {
+    const findings = await round3Secrets();
+    const hits = findings.filter((f) => f.checkId === expectedCheckId && f.file.includes(filename));
+    assert.ok(hits.length >= 1, `expected ${expectedCheckId} to fire on ${filename} (${description}) -- a round-3 secrets fix may have regressed`);
+  });
+}
+
+const ROUND3_FRESH_CASES = [
+  ['11-no-semicolon-helper-call.js', 'insecure-random-token', 'Math.random() via a helper call assigned with no trailing semicolon'],
+  ['12-destructured-createhash-import.js', 'weak-password-hashing', 'md5 hashing via a destructured `const { createHash } = require(\'crypto\')` import'],
+];
+for (const [filename, expectedCheckId, description] of ROUND3_FRESH_CASES) {
+  test(`evasion-attempts/22-round3-fresh-look-11-15/${filename}: ${expectedCheckId} still caught (${description})`, async () => {
+    const findings = await round3Fresh();
+    const hits = findings.filter((f) => f.checkId === expectedCheckId && f.file.includes(filename));
+    assert.ok(hits.length >= 1, `expected ${expectedCheckId} to fire on ${filename} (${description}) -- a round-3 fresh-look fix may have regressed`);
+  });
+}
+
 test('prompt-injection-variants: buildUserMessage() neutralizes every reachable injected tag/instruction', async () => {
   const findings = await scanRepo(PROMPT_INJECTION_ROOT);
   assert.ok(Array.isArray(findings), 'scanRepo() must resolve to an array of raw findings');

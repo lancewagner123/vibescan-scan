@@ -74,7 +74,16 @@ const MULTILINE_PATTERNS = [
 
 // Matches `<name containing key/secret/token/password>: "<long literal>"` style
 // assignments/object properties in any language-ish source (JS/TS/JSON/YAML/etc.).
-const GENERIC_ENTROPY_RE = /[\w.$]*(?:key|secret|token|password|passwd|pwd)[\w]*\s*[:=]\s*["'`]([A-Za-z0-9+/_=-]{20,})["'`]/gi;
+// The separator is either a bare `:`/`=` (object property or plain assignment) OR a
+// TypeScript-annotated assignment `: <Type> =` -- the round-3 secrets audit found that a
+// generic secret written with an idiomatic TS type annotation
+// (`const apiSecret: string = '...'`, incl. `static apiSecret: string = '...'`) slipped
+// past entirely: the bare `[:=]` bound to the *annotation* colon, then demanded a quote and
+// saw the type name (`string`) instead, so it never reached the real `=`. The added
+// alternative lets the type annotation sit between the name-colon and the value `=`. Scoped
+// to the generic-entropy path only; vendor-format regexes (SINGLE_LINE_PATTERNS) already
+// match a known-prefix literal anywhere on the line regardless of annotation.
+const GENERIC_ENTROPY_RE = /[\w.$]*(?:key|secret|token|password|passwd|pwd)[\w]*\s*(?:[:=]|:\s*[A-Za-z_$][\w$.<>[\]| ]*=)\s*["'`]([A-Za-z0-9+/_=-]{20,})["'`]/gi;
 const ENTROPY_THRESHOLD = 3.0; // bits/char — placeholders/words fall well below this
 
 function scanLineGenericEntropy(line) {
@@ -110,6 +119,78 @@ function scanLineGenericEntropyUnquoted(line) {
     if (looksLikePlaceholder(value)) continue;
     if (shannonEntropy(value) < ENTROPY_THRESHOLD) continue;
     hits.push({ value, matchedText: m[0] });
+  }
+  return hits;
+}
+
+// --- Bracket-notation / computed-key generic secret (round-3 secrets audit, gap #2) ----
+//
+// GENERIC_ENTROPY_RE's name portion is `[\w.$]*` -- it excludes `[`, `]`, `'`, `"`, so a
+// secret assigned to a bracket-notation/computed property (`config['apiSecret'] = '...'`,
+// including a concatenated key `store['api' + 'Token'] = '...'`) is invisible to it even
+// though it assigns the identical high-entropy literal to the identical logical name. This
+// mirrors the exact defense already in place for check 11 (checkInsecureRandomTokenBracket,
+// closed in round 2 but never mirrored back onto checks 1/3): match a
+// `[<quoted-or-concat-literal-key>]` assignment, join the key's literal parts, and if the
+// joined name contains a key/secret/token/password keyword, run the same placeholder/
+// entropy gate.
+const BRACKET_SECRET_KEY_SRC = "(?:['\"`][\\w$]*['\"`]\\s*\\+\\s*)*['\"`][\\w$]*['\"`]";
+const GENERIC_ENTROPY_BRACKET_RE = new RegExp(
+  `\\[\\s*(${BRACKET_SECRET_KEY_SRC})\\s*\\]\\s*=\\s*["'\`]([A-Za-z0-9+/_=-]{20,})["'\`]`,
+  'g',
+);
+const KEYWORDISH_NAME_RE = /(?:key|secret|token|password|passwd|pwd)/i;
+
+function scanLineGenericEntropyBracket(line) {
+  const hits = [];
+  GENERIC_ENTROPY_BRACKET_RE.lastIndex = 0;
+  let m;
+  while ((m = GENERIC_ENTROPY_BRACKET_RE.exec(line)) !== null) {
+    const keyExpr = m[1];
+    const joined = [...keyExpr.matchAll(/['"`]([\w$]*)['"`]/g)].map((mm) => mm[1]).join('');
+    if (!KEYWORDISH_NAME_RE.test(joined)) continue;
+    const value = m[2];
+    if (looksLikePlaceholder(value)) continue;
+    if (shannonEntropy(value) < ENTROPY_THRESHOLD) continue;
+    hits.push({ value, matchedText: m[0] });
+  }
+  return hits;
+}
+
+// --- Template-literal interpolation split of a known-format secret (gap #3) -------------
+//
+// scanLineConcatChains only reassembles quoted literals joined with `+`. A known-format
+// secret split with a template-literal placeholder (`` `AKIA${''}Q3FAKE7EXAMPLE9Z` ``,
+// `` `sk_live_${''}51H8...` ``) keeps no contiguous vendor-format shape and no `+` chain,
+// so it slips past every SINGLE_LINE_PATTERNS regex. This strips `${...}` placeholders out
+// of each template literal on the line and re-tests the concatenated static parts against
+// the known-format regexes -- the template-literal analog of the existing `+`-concat
+// defense, same class as the check-15 template-literal fix (normalizeRedirectTarget).
+const TEMPLATE_LITERAL_RE = /`(?:[^`\\]|\\.)*`/g;
+
+function scanLineTemplateLiteralSplit(line) {
+  const hits = [];
+  TEMPLATE_LITERAL_RE.lastIndex = 0;
+  let m;
+  while ((m = TEMPLATE_LITERAL_RE.exec(line)) !== null) {
+    const raw = m[0];
+    // Only interesting when the template actually splices something out -- a plain
+    // `${...}`-free template literal is already covered by the per-line SINGLE_LINE_PATTERNS
+    // pass in scanTextForSecrets against the whole line.
+    if (!/\$\{[^}]*\}/.test(raw)) continue;
+    const stripped = raw.slice(1, -1).replace(/\$\{[^}]*\}/g, '');
+    if (stripped.length < 6) continue;
+    for (const pattern of SINGLE_LINE_PATTERNS) {
+      const pm = stripped.match(pattern.regex);
+      if (pm) {
+        hits.push({
+          name: pattern.name,
+          matchedText: raw.slice(0, 80),
+          secretValue: pm[0],
+          describeText: `${pattern.describe(pm[0])} (reassembled from a template literal with the \${...} interpolation stripped: ${raw.slice(0, 80)})`,
+        });
+      }
+    }
   }
   return hits;
 }
@@ -225,6 +306,24 @@ function scanTextForSecrets(text) {
         describe: 'high-entropy unquoted KEY=value assignment (dotenv-style) to a key/secret/token/password-like name',
       });
     }
+    for (const hit of scanLineGenericEntropyBracket(line)) {
+      hits.push({
+        name: 'generic-high-entropy',
+        line: i + 1,
+        matchedText: hit.matchedText,
+        secretValue: hit.value,
+        describe: 'high-entropy literal assigned to a bracket-notation key/secret/token/password-like property',
+      });
+    }
+    for (const hit of scanLineTemplateLiteralSplit(line)) {
+      hits.push({
+        name: hit.name,
+        line: i + 1,
+        matchedText: hit.matchedText,
+        secretValue: hit.secretValue,
+        describe: hit.describeText,
+      });
+    }
     for (const hit of scanLineConcatChains(line)) {
       hits.push({
         name: hit.name,
@@ -280,13 +379,17 @@ function buildHardcodedFinding(filePath, repoRelPath, hit) {
 
 // --- Check 2: .env* files present in the working tree or tracked in git --------------
 
-// Conventionally-safe template files — not real secrets, so don't flag them.
-const SAFE_ENV_TEMPLATE_NAMES = new Set([
-  '.env.example',
-  '.env.sample',
-  '.env.template',
-  '.env.dist',
-]);
+// Conventionally-safe template files — not real secrets, so don't flag them. Was an
+// exact-match Set of only the four dot-forms (`.env.example`/`.sample`/`.template`/`.dist`),
+// but round-2 broadened ENV_FILE_RE to also accept `-`/`_` separators and compound
+// suffixes -- introducing an asymmetry the round-3 secrets audit caught (FP #7):
+// `.env-example` (hyphen variant of a template), `.env.local.example` (compound template),
+// `.env.production.template`, `.env.dist.local` etc. were all flagged as real committed
+// secrets because they weren't the four literal dot-forms. Replaced the exact Set with a
+// marker regex that recognizes an example/sample/template/dist token anywhere in the
+// suffix, regardless of separator. Safe to broaden: this only ever *suppresses* a
+// filename finding.
+const SAFE_ENV_TEMPLATE_RE = /(^|[.\-_])(example|sample|template|dist)([.\-_]|$)/i;
 
 // Was /^\.env(\..+)?$/ -- required a literal dot before any suffix, so a filename like
 // ".env-production" (hyphen instead of dot) or ".env_local" (underscore) slipped through
@@ -298,7 +401,7 @@ const SAFE_ENV_TEMPLATE_NAMES = new Set([
 const ENV_FILE_RE = /^\.env([.\-_].*)?$/;
 
 function isFlaggableEnvFilename(basename) {
-  return ENV_FILE_RE.test(basename) && !SAFE_ENV_TEMPLATE_NAMES.has(basename);
+  return ENV_FILE_RE.test(basename) && !SAFE_ENV_TEMPLATE_RE.test(basename);
 }
 
 function scanEnvFilesWorkingTree(repoPath) {
@@ -546,8 +649,15 @@ function checkInsecureRandomTokenBracket(clean, original) {
 // member expression has a '.' where the regex expected '(' to follow immediately.
 // lookupFunctionReturnExpr (util.js) dispatches a dotted callee name to its own
 // class-static-method lookup.
+// The trailing `\)` no longer requires a following `;` -- a required literal semicolon
+// silently defeated every semicolon-free codebase (Standard.js, `semi:false`, much
+// AI-generated code): `const sessionToken = weakRandomToken()` (no `;`) was invisible even
+// though the identical `;`-terminated form was caught. This is the same no-semicolon gap
+// already closed for resolveConcatExpression/resolveIdentifierChain in round 2, just never
+// mirrored onto this regex (round-3 fresh-look, gap #5). `([^()]*)` already bounds the arg
+// capture at the call's own closing paren, so the `;` was never load-bearing for scoping.
 const TOKEN_ASSIGNED_TO_CALL_RE = new RegExp(
-  `(${TOKEN_ISH_NAME_SRC})\\s*(?::|=(?!=|>))\\s*(?:await\\s+)?([A-Za-z_$][\\w$]*(?:\\.[A-Za-z_$][\\w$]*)?)\\s*\\(([^()]*)\\)\\s*;`,
+  `(${TOKEN_ISH_NAME_SRC})\\s*(?::|=(?!=|>))\\s*(?:await\\s+)?([A-Za-z_$][\\w$]*(?:\\.[A-Za-z_$][\\w$]*)?)\\s*\\(([^()]*)\\)`,
   'gi',
 );
 
@@ -623,6 +733,16 @@ function scanInsecureRandomTokens(repoPath) {
 // chance to run. Fixed 2026-07-24 (round 2 evasion audit): also matches
 // `crypto['createHash'](...)` / `crypto["createHash"](...)`.
 const CREATE_HASH_CALL_RE = /crypto\s*(?:\.\s*createHash|\[\s*['"]createHash['"]\s*\])\s*\(\s*([^)]*)\)/gi;
+// Bare `createHash('md5')` with no `crypto.` receiver -- the shape produced by the single
+// most common way this API is actually imported: `const { createHash } = require('crypto')`
+// or `import { createHash } from 'crypto'`. CREATE_HASH_CALL_RE hard-codes a literal
+// `crypto` receiver, so a destructured-import call was completely invisible (round-3
+// fresh-look, gap #1 -- a mainstream idiom, not adversarial obfuscation). Only scanned when
+// the file actually destructures createHash from crypto (below), so an unrelated same-named
+// helper elsewhere can't trigger it. `(?<![.\w])` prevents matching `crypto.createHash`
+// (already covered) or a `.createHash`/`fooCreateHash` member/identifier suffix.
+const BARE_CREATE_HASH_CALL_RE = /(?<![.\w])createHash\s*\(\s*([^)]*)\)/gi;
+const DESTRUCTURED_CREATEHASH_IMPORT_RE = /(?:(?:const|let|var)\s*\{[^}]*\bcreateHash\b[^}]*\}\s*=\s*require\s*\(\s*['"]crypto['"]\s*\)|import\s*\{[^}]*\bcreateHash\b[^}]*\}\s*from\s*['"]crypto['"])/;
 const PASSWORD_CONTEXT_RE = /\b(password|passwd|pwd)\b/i;
 const AUTH_FILE_PATH_RE = /(^|\/)(auth|login|log-in|signup|sign-up|register|registration)([./]|$)/i;
 
@@ -645,9 +765,14 @@ function currentStatementWindow(text, index) {
 function checkWeakPasswordHashing(clean, original, repoRelPath) {
   const hits = [];
   const fileLooksAuthy = AUTH_FILE_PATH_RE.test(repoRelPath);
-  CREATE_HASH_CALL_RE.lastIndex = 0;
+  // Scan `crypto.createHash(...)` always; additionally scan bare `createHash(...)` when the
+  // file destructures createHash from the crypto module (see BARE_CREATE_HASH_CALL_RE).
+  const callRegexes = [CREATE_HASH_CALL_RE];
+  if (DESTRUCTURED_CREATEHASH_IMPORT_RE.test(clean)) callRegexes.push(BARE_CREATE_HASH_CALL_RE);
+  for (const callRe of callRegexes) {
+  callRe.lastIndex = 0;
   let m;
-  while ((m = CREATE_HASH_CALL_RE.exec(clean)) !== null) {
+  while ((m = callRe.exec(clean)) !== null) {
     const rawArg = m[1].trim();
     if (!rawArg) continue;
     const resolved = resolveConcatExpression(clean, rawArg);
@@ -669,6 +794,7 @@ function checkWeakPasswordHashing(clean, original, repoRelPath) {
       snippet: snippetAt(original, m.index),
       rawMessage: `crypto.createHash(...) ${algoDescription} where ${reason} -- ${algo.toUpperCase()} is fast and unsalted, so a breached password database hashed this way is fully crackable at scale. Use bcrypt, scrypt, or argon2 instead.`,
     });
+  }
   }
   return hits;
 }

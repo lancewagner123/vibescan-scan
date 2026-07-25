@@ -76,3 +76,39 @@ for (const [subfolder, filename, checkId, description] of FIXED_FALSE_POSITIVE_C
     );
   });
 }
+
+// --- Round 3 (2026-07-24) false positives ---------------------------------------------
+// These live under evasion-attempts/{19,20,22}-round3-* alongside their evasion siblings
+// (each round-3 tester kept its false-positive controls in the same folder as its evasion
+// fixtures), so unlike the cases above they aren't under false-positives/. Scanned once per
+// folder and filtered down to the one file/checkId that must stay clean.
+const { scanRepo: scanRepoR3 } = require('../src/scanners');
+const EVASION_ROOT = path.join(__dirname, 'fixtures', 'evasion-attempts');
+const r3Cache = new Map();
+async function scanR3(folder) {
+  if (!r3Cache.has(folder)) r3Cache.set(folder, scanRepoR3(path.join(EVASION_ROOT, folder), { skip: ['git-history'] }));
+  return r3Cache.get(folder);
+}
+
+const ROUND3_FALSE_POSITIVE_CASES = [
+  ['19-round3-secrets', '06-placeholder-suffix-false-positive.env.example', 'secret-hardcoded-generic', 'your-*-here / replace-with-* / set-your-* placeholder env values that keep a descriptive suffix after the key/secret/token/password word'],
+  ['19-round3-secrets', 'env-template-false-positives/.env-example', 'secret-env-committed', 'a hyphen-separated env template filename (.env-example)'],
+  ['19-round3-secrets', 'env-template-false-positives/.env.local.example', 'secret-env-committed', 'a compound env template filename (.env.local.example)'],
+  ['19-round3-secrets', 'env-template-false-positives/.env.production.template', 'secret-env-committed', 'a compound env template filename (.env.production.template)'],
+  ['20-round3-injection', 'check4-fp-parameterized-destructured', 'sql-string-concatenation', 'a parameterized query with destructured req.body params'],
+  ['20-round3-injection', 'check5-fp-async-arrow-dispatch', 'eval-on-input', 'an eval-free async-arrow lookup-table dispatch'],
+  ['20-round3-injection', 'check6-fp-static-config-method', 'cors-wildcard-with-credentials', 'a safe origin via a static config method returning a real domain'],
+];
+
+for (const [folder, filename, checkId, description] of ROUND3_FALSE_POSITIVE_CASES) {
+  test(`evasion-attempts/${folder}/${filename}: ${checkId} does NOT fire (${description})`, async () => {
+    const findings = await scanR3(folder);
+    const hits = findings.filter((f) => f.checkId === checkId && f.file.includes(filename));
+    assert.equal(
+      hits.length,
+      0,
+      `expected zero ${checkId} findings on ${folder}/${filename} (${description}) -- a round-3 false-positive fix may have regressed. ` +
+        `Found: ${JSON.stringify(hits.map((h) => ({ file: h.file, line: h.line, snippet: h.snippet })))}`
+    );
+  });
+}

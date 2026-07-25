@@ -115,7 +115,16 @@ function shannonEntropy(str) {
 }
 
 /** Obvious placeholder values that should never be flagged as real secrets. */
-const PLACEHOLDER_RE = /^(x+|0+|1+|changeme|placeholder|example|your[-_]?.*(key|secret|token)|xxx+|<.*>|\{\{.*\}\}|dummy|fake|test[-_]?key|sample)$/i;
+// The `your[-_]?...` alternative used to be anchored so the value had to *end* in
+// key/secret/token -- but the single most common `.env.example` convention adds a trailing
+// descriptive word (`your-api-key-here`, `your-personal-access-token-here`), which cleared
+// the entropy gate and leaked as a "real hardcoded secret" (round-3 secrets audit, FP #6).
+// Made the keyword non-terminal (`[\w-]*` allows trailing words), broadened the keyword set
+// to include password/passwd/pwd, and added a `replace[-_]?with...` prefix alternative to
+// cover the equally-common `replace-with-your-own-secret-value` convention. Safe to
+// broaden: this only *suppresses* a finding, and a real random-base64 secret is
+// vanishingly unlikely to spell out `your...key`/`replace-with...`.
+const PLACEHOLDER_RE = /^(x+|0+|1+|changeme|placeholder|example|.*your[-_]?.*(key|secret|token|password|passwd|pwd)[\w-]*|replace[-_]?with[\w-]*|xxx+|<.*>|\{\{.*\}\}|dummy|fake|test[-_]?key|sample)$/i;
 
 function looksLikePlaceholder(value) {
   if (PLACEHOLDER_RE.test(value)) return true;
@@ -566,7 +575,11 @@ function resolveConcatExpression(clean, expr) {
       // AI-generated code), not to bound the capture. Fixed 2026-07-24 after an
       // adversarial audit found this was a mainstream style gap, not just a deeper
       // evasion: `const HASH_ALGO = 'md5'` (no semicolon) was invisible to this resolver.
-      const declRe = new RegExp(`(?:const|let|var)\\s+${escaped}\\s*=\\s*([^;\\n]+)`);
+      // The optional `(?::\s*[^=;\n]+?)?` tolerates a TypeScript variable type annotation
+      // between the name and the `=` (`const HASH_ALGO: string = 'md5'`) -- ordinary,
+      // idiomatic TS, not an adversarial trick, but the systemic gap the round-3 injection
+      // audit found defeating every `const/let/var NAME =` resolver in the codebase.
+      const declRe = new RegExp(`(?:const|let|var)\\s+${escaped}\\s*(?::\\s*[^=;\\n]+?)?\\s*=\\s*([^;\\n]+)`);
       const dm = clean.match(declRe);
       if (!dm) return null;
       const subResolved = resolveConcatExpression(clean, dm[1]);
@@ -635,8 +648,10 @@ function resolveIdentifierChain(clean, name, maxHops = 6) {
     seen.add(current);
     const escaped = current.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     // Same fix as resolveConcatExpression above: no trailing `;` required, so
-    // semicolon-free declarations resolve too, not just semicolon-terminated ones.
-    const declRe = new RegExp(`(?:const|let|var)\\s+${escaped}\\s*=\\s*([^;\\n]+)`);
+    // semicolon-free declarations resolve too, not just semicolon-terminated ones. The
+    // optional `(?::\s*[^=;\n]+?)?` tolerates a TypeScript variable type annotation between
+    // the name and the `=` (`const input: UserDto = req.body`) -- systemic round-3 fix.
+    const declRe = new RegExp(`(?:const|let|var)\\s+${escaped}\\s*(?::\\s*[^=;\\n]+?)?\\s*=\\s*([^;\\n]+)`);
     const m = clean.match(declRe);
     if (!m) return null; // declaration not found -- can't confirm, don't guess
     const rhs = m[1].trim();
