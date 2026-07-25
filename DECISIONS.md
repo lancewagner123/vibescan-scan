@@ -525,3 +525,100 @@ gaps, and this round specifically added a cross-check pass they hadn't had befor
 library-realism) have now been run against them versus one for 1-10, and the remaining
 open items are all documented, judgment-dependent tradeoffs rather than known-exploitable
 blind spots, but they are newer code with less real-world mileage than 1-10.
+
+## Round 3 (Opus-powered): checks 1-9 retrofit, fresh look at 11-15, adversarial audit + strategic consult (2026-07-24)
+
+Opus-powered round. Five distinct passes: a testing sweep across all 15 checks, a fix
+pass, an independent adversarial technical audit, a strategic consult, and a final
+fix-from-review pass. Independently verified at close (not taken from agent reports):
+`npm test` re-run clean, `git log`/`git status` confirm a clean tree at `a6aa715` with
+four logical round-3 commits, and `bin/vibescan.js scan test/fixtures/vulnerable-demo-app`
+re-run with all 15 `checkId`s confirmed present in the raw JSON output.
+
+**What was tested:** the round-2 sophisticated-evasion catalog — which had only ever been
+applied to checks 11-15 — was retrofitted onto checks 1-9, plus a fresh adversarial look
+at 11-15 and a dedicated stress pass on check 10 (dependencies).
+
+**What was found and FIXED (21 false negatives + ~3 false positives + 4 check-10 defects):**
+- *Checks 1/3 (secrets):* TS type annotation on a generic secret, bracket/computed key
+  (`config['apiSecret']=…`), known-format secret split with a `${…}` template placeholder.
+- *Check 4 (SQL):* `db['query'](…)` bracket method, TS return-type on a builder helper,
+  SQL built into a TS-typed variable.
+- *Check 5 (eval):* `eval(await asyncArrowHelper(…))` (leading `await` stripped).
+- *Check 6 (CORS):* `credentials: x ?? true`/`|| true`; wildcard origin in a class static
+  field / TS-typed variable.
+- *Check 7 (auth):* genuinely-unauthed route with a `pageToken` handler-body local, plus a
+  single-element `[requireAuth]` array FP — one structural change restricting the auth-arg
+  test to middleware argument positions fixed a real two-way bug (was flagging the SAFE
+  route and missing the dangerous one).
+- *Check 8 (Supabase):* `process.env[[…].join('_')]` and `process.env['A'+'B']` computed keys.
+- *Check 9 (Stripe):* `req['body']` bracket read and `const { body } = req` destructured read.
+- *Checks 11/12:* no-semicolon helper-call token; destructured `const { createHash } = require('crypto')`.
+- *Checks 13/15:* `req.body as Dto` / `req.body!`; spread-into-create mass assignment;
+  `res.redirect(req['query'].next)`.
+- *Systemic:* shared resolvers now tolerate a TS variable annotation before `=`.
+- *False positives fixed:* `your-*-here`/`replace-with-*` placeholder env values; hyphen/
+  compound env-template filenames (`.env-example`); ES6 shorthand `{ httpOnly, secure }`.
+- *Check 10:* colliding finding ids across workspace package.json files, raw npm stderr
+  leaking to terminal, missing child-process timeout, misleading hardcoded "no network
+  access" warning now attributes the real cause.
+
+**Documented as accepted scope limits (not force-fixed):** base64+split-literal secret
+combo; keyword-named-LHS non-adjacency; check-4 class-static/bare SQL builders; check-5
+computed `eval`/`exec` callees; check-11 IIFE/getter token sources; check-10 dev-vs-prod
+severity, lockfile/package.json divergence, and pnpm/yarn + `workspace:` monorepo gaps
+(npm audit cannot read pnpm/yarn lockfiles — a workspace-aware rewrite is out of scope).
+
+**Before/after test count:** 48/48 at the start of the round → **80/80 at the end** (32 new
+regression + false-positive tests, incl. two network-free unit tests for the check-10 fixes).
+Zero skips/todos.
+
+**Adversarial auditor's verdict — NO blocking issues.** The auditor did not trust the fix
+report: they read every scanner in full, authored their *own* bypass fixtures (not the
+repo's), and ran them against both the current HEAD and a worktree checked out at the
+pre-round-3 commit `b82d2a3` to get true before/after deltas. Five of the most consequential
+fixes were independently reproduced with real before/after output (eval-on-input, bracket/
+concat secrets, Stripe `req['body']`/destructure, Supabase computed env key, and the check-7
+two-way auth bug). The shared `stripComments` chokepoint — the single-point-of-failure that
+every static check runs against — was stress-tested against 15 adversarial inputs and
+preserved length + newline count exactly on all of them (a latent fragility, not an active
+bug). Only three non-blocking polish notes: a raw `git` stderr leak on non-git targets, an
+unguarded `stripComments` call site, and a destructured/aliased `Math.random` doc-completeness
+nit. Verdict: "Trustworthy to ship as a fast first-pass scanner within the limits
+`SECURITY_SCOPE.md` already discloses." The final fix-from-review pass declined to
+manufacture fixes for the three accepted-limitation polish notes and left the tree clean.
+
+**Strategic consultant's recommendation — stop hardening, measure real-world FP rate, ship.**
+Quoted directly, not paraphrased:
+
+> "The scanning engine is sound and has been verified sound by five independent panels and
+> three hardening rounds. You are now well past the point of diminishing returns on
+> regex-hardening, the raw finding counts are misleading you into thinking otherwise, and the
+> single most valuable thing you have never done — run this against a real repo you didn't
+> write — is the one thing standing between 'verified against fixtures' and 'survives a real
+> user.' Stop hardening. Measure the real-world false-positive rate, fix the README's one
+> honesty gap, and ship."
+
+> "Direct recommendation: stop hardening and get this in front of real code. Specifically —
+> clone 15-30 real, public AI-generated apps (Lovable/Bolt/Replit/Cursor output on GitHub),
+> run VibeScan, hand-triage every single finding as true-or-false-positive, and measure the
+> real-world false-positive rate. Then publish."
+
+The consultant's rationale: round 3's 21 findings were a one-time backlog flush (the round-2
+catalog finally applied to the nine checks that had never seen it), not fresh discovery — new
+vulnerability *classes* per round are collapsing and what remains are architectural limits a
+regex tool structurally cannot close. Every round so far has been a closed loop (the same
+process invents the evasions and closes them against its own fixtures), which says nothing
+about the only metric that decides adoption: how often the tool cries wolf on code someone
+else wrote. The consultant also flagged three README/docs honesty drifts to fix before any
+public post: checks 11-15 are billed identically to 1-10 despite being judgment-heavier with
+unfixable false positives (`secretIngredient`, `gameToken`); the Express/JS framework
+limitation isn't in the README; and (now addressed by this entry) DECISIONS.md was a full
+round behind. Confidence rating in founder's terms: checks 1-10 HIGH (believe them), checks
+11-15 MODERATE and prone to false alarms (treat as "worth a look," not a verdict).
+
+**Actionable next step for the human:** do NOT run a round 4 of fixture hardening. Fix the
+README honesty gap (distinguish the 1-10 vs 11-15 confidence tiers; disclose the Express/JS
+framework scope), then run VibeScan against 15-30 real public AI-generated repos and
+hand-triage every finding to measure the real-world false-positive rate. Publish once that
+number is known.
