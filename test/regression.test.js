@@ -402,6 +402,53 @@ test('evasion-attempts/21-round3-authz-webhook/07-admin-array-single-middleware.
   assert.equal(hits.length, 0, `expected zero missing-auth-middleware findings -- the single-element middleware-array fix may have regressed. Found: ${JSON.stringify(hits)}`);
 });
 
+// --- Bug 4 fix (2026-07-24, real-world validation exercise) --------------------------
+// supabase-rls-disabled (check 8) previously only ever read JS/TS config/table-definition
+// text -- it never looked inside a .sql file at all, which is exactly where a real
+// Supabase migration defines an RLS policy. This was a real, hand-verified false negative
+// (see docs/REAL_WORLD_VALIDATION.md §6): while manually triaging a Bolt.new-built
+// reservation app's dependency findings, the person doing triage found a migration
+// granting the public `anon` role unrestricted `SELECT ... USING (true)` access to a table
+// of guest names, emails, and phone numbers -- and check 8 never flagged it. Fixtures below
+// reconstruct that pattern (anonymized, not tied to the original repo).
+const SUPABASE_RLS_SQL_ROOT = path.join(EVASION_FIXTURES_ROOT, '23-supabase-rls-sql');
+let supabaseRlsSqlFindings;
+async function supabaseRlsSqlFindingsFor() {
+  supabaseRlsSqlFindings =
+    supabaseRlsSqlFindings || (await scanRepo(SUPABASE_RLS_SQL_ROOT, { skip: ['git-history', 'dependencies'] }));
+  return supabaseRlsSqlFindings;
+}
+
+test('evasion-attempts/23-supabase-rls-sql/reservations-permissive-policy.sql: supabase-rls-disabled now fires on a real .sql migration with an overly-permissive anon SELECT policy', async () => {
+  const findings = await supabaseRlsSqlFindingsFor();
+  const hits = findings.filter(
+    (f) => f.checkId === 'supabase-rls-disabled' && f.file.includes('reservations-permissive-policy.sql')
+  );
+  assert.ok(
+    hits.length >= 1,
+    'expected supabase-rls-disabled to fire on reservations-permissive-policy.sql (CREATE POLICY ... TO anon ... USING (true)) ' +
+      `-- the new .sql migration coverage may have regressed. Found checkIds: ${JSON.stringify(findings.map((f) => f.checkId))}`
+  );
+  assert.equal(
+    hits[0].severity,
+    'critical',
+    "a real anon-readable table of guest PII should be reported at critical severity, matching check 8's other findings"
+  );
+});
+
+test('evasion-attempts/23-supabase-rls-sql/reservations-scoped-policy.sql: supabase-rls-disabled does NOT fire on a policy properly scoped with USING (auth.uid() = user_id)', async () => {
+  const findings = await supabaseRlsSqlFindingsFor();
+  const hits = findings.filter(
+    (f) => f.checkId === 'supabase-rls-disabled' && f.file.includes('reservations-scoped-policy.sql')
+  );
+  assert.equal(
+    hits.length,
+    0,
+    'expected zero supabase-rls-disabled findings for policies scoped via USING (auth.uid() = user_id), even when one of ' +
+      `them also grants the anon role -- the new .sql migration coverage may be over-flagging. Found: ${JSON.stringify(hits)}`
+  );
+});
+
 // --- Round 3 dependency-check (check 10) fixes ----------------------------------------
 // These are unit-level assertions on dependencies.js internals rather than scanRepo() runs,
 // because the full check-10 path needs npm + live network (too flaky to gate CI on). The

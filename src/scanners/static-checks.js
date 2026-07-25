@@ -21,6 +21,11 @@ const {
 } = require('./util');
 
 const SOURCE_EXTENSIONS = ['.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs'];
+// Check 8's sibling SQL-migration pass (see the "Check 8, sibling detection" section
+// below) walks the repo a second time restricted to this extension -- real Supabase/
+// Postgres RLS policies live in .sql migration files, which SOURCE_EXTENSIONS above never
+// includes and every other check in this file has no business reading anyway.
+const SQL_EXTENSIONS = ['.sql'];
 
 function lineOfIndex(text, index) {
   return text.slice(0, index).split(/\r?\n/).length;
@@ -231,21 +236,115 @@ function argLooksInterpolated(arg, clean) {
 
 // `exec`/`execSync` collide with an extremely common, totally unrelated JS idiom:
 // RegExp.prototype.exec() (e.g. `while ((m = re.exec(text)) !== null)`), which is not
-// child_process at all. Requiring the file to actually reference the child_process
-// module before treating exec/execSync as the dangerous shell-spawning call filters
-// that out — a regex-heavy file that never imports child_process can't be doing shell
-// command injection via exec() in the first place.
-const CHILD_PROCESS_REFERENCE_RE = /child_process/;
+// child_process at all.
+//
+// This used to be guarded by "does this FILE mention the substring `child_process`
+// anywhere" — which stops a regex-only file with no child_process import at all, but does
+// NOT stop the shape the real-world false-positive validation actually found
+// (docs/REAL_WORLD_VALIDATION.md §5/§6, all 7 real-world eval-on-input false positives): a
+// file that legitimately imports child_process for one thing and ALSO calls RegExp#exec
+// somewhere else in that same file (a filename-number extractor, an allowlist validator, a
+// pattern-scan over text) — file-wide "mentions child_process" is true, so the old guard
+// let every unrelated .exec() in that file straight through. The fix traces each
+// exec/execSync CALL SITE back to its own receiver instead of checking the whole file:
+//   - a bare call (`exec(cmd)`/`execSync(cmd)`, no receiver) only counts if that exact
+//     name was destructured directly off `require('child_process')`/`import ... from
+//     'child_process'`;
+//   - a member call (`x.exec(cmd)`/`x.execSync(cmd)`) only counts if `x` is `require(
+//     'child_process')` written inline, or a variable/namespace import traced back to a
+//     `require('child_process')`/`import * as x from 'child_process'`/`import x from
+//     'child_process'` declaration.
+// Any other receiver shape — a regex literal (`/pattern/.exec(...)`), a variable assigned
+// from `new RegExp(...)` or a regex literal, an unrelated object, or anything this can't
+// confidently resolve — is left alone (bail rather than guess). That's also what actually
+// excludes RegExp#exec: it never satisfies the child_process-traced check below, so no
+// separate "is this receiver a regex" test is even needed.
+const CHILD_PROCESS_REQUIRE_STRING_RE = "['\"`]child_process['\"`]";
+
+// Classifies what precedes an exec/execSync callee at `calleeIndex` (the index where the
+// literal text "exec"/"execSync" itself starts, i.e. DANGEROUS_CALLEE_RE's m.index for
+// that branch) into one of:
+//   { kind: 'bare' }                    -- exec(...)/execSync(...), no receiver at all
+//   { kind: 'inline-require' }          -- require('child_process').exec(...)
+//   { kind: 'identifier', name }        -- name.exec(...)/name.execSync(...)
+//   { kind: 'other' }                   -- some other/unrecognized receiver shape
+// Only looks at a bounded window immediately before calleeIndex — plenty for any real
+// receiver expression, and keeps this a cheap per-match check rather than a file-wide scan.
+const RECEIVER_WINDOW_CHARS = 400;
+
+function classifyExecReceiver(clean, calleeIndex) {
+  const windowStart = Math.max(0, calleeIndex - RECEIVER_WINDOW_CHARS);
+  const before = clean.slice(windowStart, calleeIndex);
+
+  if (!/\.\s*$/.test(before)) return { kind: 'bare' };
+
+  const inlineRequireRe = new RegExp(`require\\s*\\(\\s*${CHILD_PROCESS_REQUIRE_STRING_RE}\\s*\\)\\s*\\.\\s*$`);
+  if (inlineRequireRe.test(before)) return { kind: 'inline-require' };
+
+  // A single bare identifier immediately before the dot, e.g. `cp.exec(`/
+  // `child_process.exec(`. The `(?:^|[^\w$.\])])` alternative requires the character
+  // right before the identifier (if any, within the window) to NOT itself be a word/`.`/
+  // `)`/`]` character, so a longer chain like `foo.bar.exec(` isn't misread as a bare
+  // "bar" receiver — left as 'other' (unresolved) instead.
+  const identMatch = /(?:^|[^\w$.\])])\s*([A-Za-z_$][\w$]*)\s*\.\s*$/.exec(before);
+  if (identMatch) return { kind: 'identifier', name: identMatch[1] };
+
+  return { kind: 'other' };
+}
+
+// True if `callName` (the literal text "exec" or "execSync" that DANGEROUS_CALLEE_RE
+// matched with no receiver) was destructured directly off a child_process import in this
+// file. No rename-handling needed here: a renamed destructure (`const { exec: run } =
+// require('child_process')`) produces a bare call site that literally reads "run(...)",
+// which DANGEROUS_CALLEE_RE never matches in the first place — this function is only ever
+// asked about the plain, unrenamed form.
+function isPlainDestructuredFromChildProcess(clean, callName) {
+  const escaped = callName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const requireRe = new RegExp(
+    `(?:const|let|var)\\s*\\{[^}]*\\b${escaped}\\b(?!\\s*:)[^}]*\\}\\s*=\\s*require\\(\\s*${CHILD_PROCESS_REQUIRE_STRING_RE}\\s*\\)`,
+  );
+  if (requireRe.test(clean)) return true;
+  const importRe = new RegExp(
+    `import\\s*\\{[^}]*\\b${escaped}\\b(?!\\s+as\\b)[^}]*\\}\\s*from\\s*${CHILD_PROCESS_REQUIRE_STRING_RE}`,
+  );
+  return importRe.test(clean);
+}
+
+// True if `varName` was itself assigned/imported from the child_process module in this
+// file (`const cp = require('child_process')`, `import * as cp from 'child_process'`,
+// `import cp from 'child_process'`) — as opposed to merely being NAMED something
+// child_process-ish while actually holding a regex (`new RegExp(...)`, a regex literal) or
+// anything else. Traced back to a real declaration rather than trusted by name.
+function isChildProcessModuleVar(clean, varName) {
+  const escaped = varName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const requireRe = new RegExp(`(?:const|let|var)\\s+${escaped}\\s*=\\s*require\\(\\s*${CHILD_PROCESS_REQUIRE_STRING_RE}\\s*\\)`);
+  if (requireRe.test(clean)) return true;
+  const importStarRe = new RegExp(`import\\s*\\*\\s*as\\s+${escaped}\\s+from\\s*${CHILD_PROCESS_REQUIRE_STRING_RE}`);
+  if (importStarRe.test(clean)) return true;
+  const importDefaultRe = new RegExp(`import\\s+${escaped}\\s+from\\s*${CHILD_PROCESS_REQUIRE_STRING_RE}`);
+  return importDefaultRe.test(clean);
+}
+
+// Ties the receiver classification and the two resolvers above together: true only when
+// this SPECIFIC exec/execSync call site traces back to a real child_process import, false
+// (bail rather than guess) for every other receiver shape — including a regex literal, a
+// regex-holding variable, or any receiver this can't confidently resolve.
+function isChildProcessExecCall(clean, calleeIndex, callName) {
+  const receiver = classifyExecReceiver(clean, calleeIndex);
+  if (receiver.kind === 'bare') return isPlainDestructuredFromChildProcess(clean, callName);
+  if (receiver.kind === 'inline-require') return true;
+  if (receiver.kind === 'identifier') return isChildProcessModuleVar(clean, receiver.name);
+  return false; // 'other' — unrecognized receiver shape, don't guess
+}
 
 function checkEvalOnInput(clean, filePath, original) {
   const hits = [];
-  const referencesChildProcess = CHILD_PROCESS_REFERENCE_RE.test(clean);
   DANGEROUS_CALLEE_RE.lastIndex = 0;
   let m;
   while ((m = DANGEROUS_CALLEE_RE.exec(clean)) !== null) {
     const callName = m[1];
-    if ((callName === 'exec' || callName === 'execSync') && !referencesChildProcess) {
-      continue; // almost certainly RegExp#exec, not child_process.exec/execSync
+    if ((callName === 'exec' || callName === 'execSync') && !isChildProcessExecCall(clean, m.index, callName)) {
+      continue; // this call site doesn't trace back to child_process -- almost certainly RegExp#exec or an unrelated exec()
     }
     const openParenIndex = m.index + m[0].length - 1; // position of the '(' itself
     const extracted = extractBalancedCallArg(clean, openParenIndex);
@@ -674,6 +773,178 @@ function checkSupabaseRlsDisabled(clean, filePath, original) {
     }
   }
 
+  return hits;
+}
+
+// --- Check 8, sibling detection: overly-permissive RLS policy in a .sql migration file --
+// Everything above in checkSupabaseRlsDisabled() only ever reads JS/TS config/table-
+// definition TEXT (an object literal's rowLevelSecurity:false-shaped key, or a
+// service_role key referenced from client code) -- it never looks inside a real Supabase
+// migration's own .sql file, which is exactly where an actual RLS policy gets defined.
+// This was a real, hand-verified false negative (docs/REAL_WORLD_VALIDATION.md §6): while
+// manually triaging a Bolt.new-built reservation app, a migration was found granting the
+// public `anon` role unrestricted `SELECT ... USING (true)` access to a table of guest
+// names, emails, and phone numbers -- and check 8 never flagged it, because it never read
+// .sql files at all. This section closes that gap with a dedicated .sql-file pass, wired
+// into scan() below alongside (not instead of) the existing SOURCE_EXTENSIONS pass.
+
+// Blanks out SQL's own comment syntax (`-- line comment`, `/* block comment */`), the same
+// "preserve length and every newline, replace comment characters with spaces" convention
+// util.js's stripComments() uses for JS -- so a line number computed against the blanked
+// text still lines up with the original source, and so a migration note that merely
+// *mentions* "DISABLE ROW LEVEL SECURITY" or "USING (true)" in a comment isn't mistaken
+// for a live statement.
+function stripSqlComments(text) {
+  let out = '';
+  let state = 'code'; // 'code' | 'string' | 'lineComment' | 'blockComment'
+  const n = text.length;
+  let i = 0;
+  while (i < n) {
+    const ch = text[i];
+    const next = i + 1 < n ? text[i + 1] : '';
+    if (state === 'code') {
+      if (ch === '-' && next === '-') { state = 'lineComment'; out += '  '; i += 2; continue; }
+      if (ch === '/' && next === '*') { state = 'blockComment'; out += '  '; i += 2; continue; }
+      if (ch === "'") { state = 'string'; out += ch; i += 1; continue; }
+      out += ch;
+      i += 1;
+      continue;
+    }
+    if (state === 'string') {
+      // Standard SQL escapes an embedded quote by doubling it ('') rather than a
+      // backslash -- keep both characters and stay inside the string state.
+      if (ch === "'" && next === "'") { out += "''"; i += 2; continue; }
+      if (ch === "'") { state = 'code'; out += ch; i += 1; continue; }
+      out += ch;
+      i += 1;
+      continue;
+    }
+    if (state === 'lineComment') {
+      if (ch === '\n') { state = 'code'; out += '\n'; i += 1; continue; }
+      out += ' ';
+      i += 1;
+      continue;
+    }
+    // state === 'blockComment'
+    if (ch === '*' && next === '/') { state = 'code'; out += '  '; i += 2; continue; }
+    out += ch === '\n' ? '\n' : ' ';
+    i += 1;
+  }
+  return out;
+}
+
+// Matches a CREATE POLICY statement's header far enough to capture the table it applies
+// to -- the policy's own name (quoted or bare, immediately after POLICY) is skipped since
+// nothing downstream needs it. Case-insensitive and tolerant of newlines/arbitrary
+// whitespace between tokens, since real migrations routinely wrap this across several
+// lines (see the fixture under test/fixtures/evasion-attempts/23-supabase-rls-sql/).
+const CREATE_POLICY_RE = /CREATE\s+POLICY\s+(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|[A-Za-z_][\w]*)\s+ON\s+([A-Za-z_][\w."]*)/gi;
+
+const POLICY_FOR_RE = /\bFOR\s+(SELECT|INSERT|UPDATE|DELETE|ALL)\b/i;
+// Stops at the next USING/WITH CHECK clause (or the statement's terminating ';'), so the
+// captured role list doesn't swallow the rest of the statement.
+const POLICY_TO_RE = /\bTO\s+([^;]+?)(?=\s+USING\b|\s+WITH\s+CHECK\b|;|$)/i;
+const POLICY_USING_KEYWORD_RE = /\bUSING\s*\(/i;
+// Any policy granting the wildcard `anon` role, or Postgres's own built-in `public`/
+// `PUBLIC` pseudo-role, is reachable by literally anyone with network access to the
+// Supabase project's anon key (which, per Supabase's own documented architecture, is
+// meant to ship in every client bundle -- see REAL_WORLD_VALIDATION.md §5.1). Matching
+// both, not just the literal string "anon", avoids missing the equally-dangerous
+// `TO public`/`TO PUBLIC` form.
+const PERMISSIVE_ROLE_RE = /\b(anon|public)\b/i;
+
+// Given a single statement's text and the RegExp match of a "USING (" keyword+paren found
+// inside it, extracts the parenthesized expression via the same balanced-paren walker
+// already used above for JS call arguments (extractBalancedCallArg works on any text --
+// it only tracks (), quote state, and backslash escapes, none of which are JS-specific).
+function extractUsingExpr(stmt, usingKeywordMatch) {
+  const openParenIndex = usingKeywordMatch.index + usingKeywordMatch[0].length - 1;
+  const extracted = extractBalancedCallArg(stmt, openParenIndex);
+  return extracted ? extracted.arg.trim() : null;
+}
+
+// Walks forward from `fromIndex` (the start of a CREATE POLICY match) tracking paren depth
+// and single-quoted string state to find this statement's own terminating ';' -- needed so
+// the TO/USING clauses inspected below belong to THIS policy, not a later one in the same
+// migration file. Heuristic, not a real SQL parser, same tradeoff as the rest of this file.
+function extractSqlStatementText(text, fromIndex) {
+  let depth = 0;
+  let inString = false;
+  for (let i = fromIndex; i < text.length; i++) {
+    const ch = text[i];
+    if (inString) {
+      if (ch === "'" && text[i + 1] === "'") { i += 1; continue; } // doubled-quote escape
+      if (ch === "'") inString = false;
+      continue;
+    }
+    if (ch === "'") { inString = true; continue; }
+    if (ch === '(') depth++;
+    else if (ch === ')') depth--;
+    else if (ch === ';' && depth <= 0) return text.slice(fromIndex, i + 1);
+  }
+  return text.slice(fromIndex); // unterminated statement (e.g. missing trailing ';') -- take the rest of the file
+}
+
+function checkSupabaseRlsPermissivePolicySql(clean, original) {
+  const hits = [];
+  CREATE_POLICY_RE.lastIndex = 0;
+  let m;
+  while ((m = CREATE_POLICY_RE.exec(clean)) !== null) {
+    const tableName = m[1];
+    const stmt = extractSqlStatementText(clean, m.index);
+
+    const toMatch = stmt.match(POLICY_TO_RE);
+    if (!toMatch || !PERMISSIVE_ROLE_RE.test(toMatch[1])) continue; // scoped to a named/authenticated role only -- not this pattern
+
+    const forMatch = stmt.match(POLICY_FOR_RE);
+    const operation = forMatch ? forMatch[1].toUpperCase() : null; // an omitted FOR clause defaults to ALL in Postgres
+
+    const usingKeywordMatch = POLICY_USING_KEYWORD_RE.exec(stmt);
+    const usingExpr = usingKeywordMatch ? extractUsingExpr(stmt, usingKeywordMatch) : null;
+
+    const triviallyPermissive = usingExpr !== null && /^true$/i.test(usingExpr);
+    // INSERT-only policies use WITH CHECK to gate the *new* row, not USING -- omitting
+    // USING there isn't the same "every existing row is now readable/writable" shape as
+    // omitting it for SELECT/UPDATE/DELETE/ALL, where Postgres treats a missing USING
+    // clause as an implicit `USING (true)` (unrestricted) by default.
+    const missingUsingIsPermissive = !usingKeywordMatch && operation !== 'INSERT';
+
+    if (!triviallyPermissive && !missingUsingIsPermissive) continue;
+
+    const anchorIndex = usingKeywordMatch ? m.index + usingKeywordMatch.index : m.index;
+    const reason = triviallyPermissive
+      ? `its USING (${usingExpr}) clause imposes no real row filter`
+      : `it has no USING clause at all, which Postgres/Supabase treats as unrestricted access to every row for ${operation || 'ALL'} operations`;
+
+    hits.push({
+      line: lineOfIndex(original, anchorIndex),
+      snippet: snippetAt(original, m.index, 200),
+      rawMessage: `CREATE POLICY on "${tableName}" grants the public/anon role ${operation || 'ALL'} access with no real restriction -- ${reason}. Any anonymous client can read (or write, depending on the operation) every row in this table, not just rows the requester is actually entitled to -- exactly the shape of a real Supabase data-exposure bug (see docs/REAL_WORLD_VALIDATION.md §6).`,
+    });
+  }
+  return hits;
+}
+
+function checkSupabaseRlsSqlMigration(original) {
+  const clean = stripSqlComments(original);
+  const hits = [];
+
+  // RLS_DISABLED_PATTERNS[0] (`ALTER TABLE ... DISABLE ROW LEVEL SECURITY`) was already
+  // written for exactly this SQL shape, but before this .sql pass existed it could only
+  // ever match if that literal text happened to appear inside a scanned .js/.ts file (e.g.
+  // a template-literal migration string) -- a real .sql migration file was invisible to
+  // it, same root cause as the missing CREATE POLICY coverage above. Reused unchanged, now
+  // that .sql files are actually being read.
+  const alterMatch = clean.match(RLS_DISABLED_PATTERNS[0]);
+  if (alterMatch) {
+    hits.push({
+      line: lineOfIndex(original, alterMatch.index),
+      snippet: snippetAt(original, alterMatch.index),
+      rawMessage: 'SQL migration explicitly disables row level security (RLS) on a Supabase/Postgres table.',
+    });
+  }
+
+  hits.push(...checkSupabaseRlsPermissivePolicySql(clean, original));
   return hits;
 }
 
@@ -1438,6 +1709,46 @@ function scan(repoPath, opts = {}) {
           rawMessage: hit.rawMessage,
         });
       }
+    }
+  }
+
+  // --- .sql migration pass (check 8's sibling detection) -------------------------------
+  // A second, separate walk restricted to .sql files -- deliberately not folded into the
+  // SOURCE_EXTENSIONS loop above, since every other check in CHECKS targets JS/TS call
+  // shapes (`.query(`, `res.cookie(`, `eval(`, ...) that have no business running against
+  // raw SQL text, and folding .sql into SOURCE_EXTENSIONS would run all nine of them
+  // against every migration file for no benefit.
+  let sqlFiles;
+  try {
+    sqlFiles = walkFiles(repoPath, { extensions: SQL_EXTENSIONS });
+  } catch (err) {
+    warnings.push(`static-checks.js: failed to walk repo tree for .sql files: ${err.message}`);
+    sqlFiles = [];
+  }
+
+  for (const filePath of sqlFiles) {
+    const original = readTextFile(filePath);
+    if (!original) continue;
+    const repoRelPath = path.relative(repoPath, filePath).split(path.sep).join('/');
+
+    let hits;
+    try {
+      hits = checkSupabaseRlsSqlMigration(original);
+    } catch (err) {
+      warnings.push(`static-checks.js: supabase-rls-disabled (sql migration pass) failed on ${repoRelPath}: ${err.message}`);
+      continue;
+    }
+    for (const hit of hits) {
+      findings.push({
+        id: makeId('supabase-rls-disabled', [repoRelPath, String(hit.line), hit.snippet]),
+        checkId: 'supabase-rls-disabled',
+        severity: 'critical',
+        category: 'authz',
+        file: repoRelPath,
+        line: hit.line,
+        snippet: hit.snippet.slice(0, 200),
+        rawMessage: hit.rawMessage,
+      });
     }
   }
 
