@@ -11,6 +11,7 @@
     "bin",
     "src",
     "docs",
+    "!docs/field_journal.md",
     "SECURITY_SCOPE.md"
   ],
   "scripts": {
