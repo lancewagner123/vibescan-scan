@@ -701,3 +701,36 @@ doesn't support. With that paragraph now rewritten in both `README.md` and
 `SECURITY_SCOPE.md`, and this entry as the permanent record of why, the tool is honest about
 exactly one thing being reliable (dependency findings) and everything else being a lead worth
 a human's five minutes, which is what it was always supposed to be. Ship it.
+
+## `eval-on-input` receiver-tracing fix for `RegExp.prototype.exec()` (2026-07-24)
+
+Closes the "future work" item this entry itself flagged above (line 696): teaching
+`eval-on-input` to exclude `RegExp.prototype.exec()`. This had already been attempted once
+before the real-world validation ran (a same-day comment in `static-checks.js` describes "an
+exec()/execSync() vs RegExp.prototype.exec() collision" fix), but the guard it left behind —
+"does this FILE mention the substring `child_process` anywhere" — was file-wide, not call-site
+specific. All 7 real-world false positives (`docs/REAL_WORLD_VALIDATION.md` §5.4/§6: a
+filename-number extractor, an allowlist validator, a pattern-scan over text, all built with
+`.exec()` on a regex) came from exactly the shape that guard couldn't see: a file that
+legitimately imports `child_process` for one thing and separately calls `RegExp#exec` for
+something unrelated. Since the file genuinely mentions `child_process`, the old guard let the
+unrelated `.exec()` straight through.
+
+**Fix:** `checkEvalOnInput()` now traces each `exec`/`execSync` *call site* back to its own
+receiver instead of scanning the whole file for a substring — a bare call only counts if that
+exact name was destructured off `require('child_process')`/`import ... from 'child_process'`;
+a member call (`x.exec(...)`) only counts if `x` resolves to `require('child_process')` inline
+or a variable/namespace import traced back to a `child_process` declaration. Any other receiver
+(a regex literal, a variable holding `new RegExp(...)` or a regex literal, or anything
+unresolvable) is left alone — this falls out of requiring positive evidence rather than needing
+a separate "is this a regex" check.
+
+Two new fixtures reconstruct the real-world shapes under
+`test/fixtures/false-positives/5-eval-on-input/` (`filename-number-extractor.js`,
+`allowlist-validator.js`), asserted to produce zero `eval-on-input` findings in
+`test/false-positives.test.js`. Positive controls in the same folder
+(`child-process-exec-real.js`: bare-destructured, `execSync`, and `child_process.exec()`-via-
+namespace-import calls with interpolated input; `eval-and-function-tainted.js`: `eval()`/`new
+Function()` on tainted input) confirm the fix didn't overcorrect into silence. Full suite:
+91/91 passing after this fix (adds 4 new tests: 2 false-positive fixtures + 2 positive
+controls).

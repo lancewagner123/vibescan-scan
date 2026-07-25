@@ -81,6 +81,30 @@ const FIXED_FALSE_POSITIVE_CASES = [
     'secret-hardcoded-generic',
     'variable/property name contains "key"/"secret"/"token" but the RHS is an env-var reference (import.meta.env.X / process.env.X), not a literal value',
   ],
+  // --- Real-world false-positive validation: eval-on-input / RegExp#exec (2026-07-24,
+  // docs/REAL_WORLD_VALIDATION.md §5.4, §6) ---
+  // All 7 real-world eval-on-input false positives were RegExp.prototype.exec() calls --
+  // a filename-number extractor, an allowlist validator, a pattern-scan over text --
+  // mistaken for child_process.exec()/execSync() purely because both share the literal
+  // substring "exec". A prior fix guarded on "does this FILE mention child_process
+  // anywhere", which still let an unrelated .exec() through in any file that also
+  // legitimately imports child_process for something else -- exactly the shape
+  // filename-number-extractor.js reconstructs. checkEvalOnInput() now traces each
+  // exec/execSync call site back to its own receiver (bare destructured import, or a
+  // variable/`require('child_process')` traced back to the child_process module) instead
+  // of scanning the whole file for the substring.
+  [
+    '5-eval-on-input',
+    'filename-number-extractor.js',
+    'eval-on-input',
+    'RegExp.prototype.exec() extracting a leading number from a filename, in a file that also legitimately imports child_process for an unrelated purpose',
+  ],
+  [
+    '5-eval-on-input',
+    'allowlist-validator.js',
+    'eval-on-input',
+    'RegExp.prototype.exec() validating a plugin name against an allowlist pattern',
+  ],
 ];
 
 for (const [subfolder, filename, checkId, description] of FIXED_FALSE_POSITIVE_CASES) {
@@ -115,6 +139,22 @@ const POSITIVE_CONTROL_CASES = [
     '_control-literal-secret-still-fires.js',
     'secret-hardcoded-generic',
     'an ordinary hardcoded high-entropy literal (not a JWT, not an env-var reference) must still be flagged',
+  ],
+  // The eval-on-input receiver-tracing fix (above) must not overcorrect into silence: real
+  // child_process.exec()/execSync() calls with interpolated input, and eval()/new Function()
+  // on tainted input (which never go through the receiver-tracing logic at all), must all
+  // still fire exactly as before.
+  [
+    '5-eval-on-input',
+    'child-process-exec-real.js',
+    'eval-on-input',
+    'real child_process.exec()/execSync() calls (bare destructured, and via a require(\'child_process\')-traced variable) with interpolated request input must still be flagged',
+  ],
+  [
+    '5-eval-on-input',
+    'eval-and-function-tainted.js',
+    'eval-on-input',
+    'eval()/new Function() on tainted request input must still be flagged',
   ],
 ];
 
