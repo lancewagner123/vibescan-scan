@@ -708,6 +708,40 @@ fresh, non-fixture synthetic reproductions run through the real CLI — see
 `docs/REAL_WORLD_VALIDATION.md`'s "Fix status" section for the detailed writeup and hand-run
 results.
 
+**Second update (2026-07-24, third pass) — the same 20 repos were re-cloned and re-scanned from
+scratch against the fixed build (`docs/REAL_WORLD_VALIDATION.md`'s "Re-validation (post-fix)"
+section). Two of the four targeted fixes above measurably improved on real code
+(`eval-on-input`'s `RegExp.exec()` collision: 100%→0% FP; `supabase-rls-disabled`'s new `.sql`
+coverage: 5/5 TRUE_POSITIVE, including the exact vulnerability the whole exercise was built
+around). The Supabase-anon-key fix was also confirmed fixed on the exact three repos that
+motivated it — but `secret-hardcoded-generic`/`secret-git-history`'s blended real-world FP rate
+stayed at 100% because four DIFFERENT false-positive shapes filled the gap immediately, plus one
+new, unrelated `vulnerable-dependency` bug. All five are now fixed:**
+
+5. **`secret-hardcoded-generic` — four new false-positive shapes** (auto-generated Supabase
+   FK-constraint names; a bare `key:` config-array property name; non-English README placeholder
+   text; `self.access_key`-style Python attribute references not covered by the four-hardcoded-
+   root env-var-reference guard). Fixed in `src/scanners/secrets.js` — see that file's inline
+   comments (search `Real-world FP fix (2026-07-24, docs/REAL_WORLD_VALIDATION.md re-validation`)
+   and `docs/REAL_WORLD_VALIDATION.md`'s "Fix status (bugs A-D)" section for the full reasoning
+   behind each. The `self.access_key` fix specifically replaces the old four-root allowlist with
+   a per-dot-segment identifier-shape check (low digit density, few case transitions) — verified
+   by hand against the exact historical regression case (a JWT/base64-shaped secret containing
+   literal dots) before being considered done, per that fix's own documented history of having
+   been over-broadened once already. Regression-tested:
+   `test/fixtures/false-positives/25-real-world-secrets-round2/`.
+6. **`vulnerable-dependency` — installed-version boundary comparison.** `dependencies.js` used to
+   trust `npm audit`'s own per-package `severity`/`range` aggregate with zero independent
+   verification against the version actually resolved in the lockfile. Now cross-checks each
+   advisory's own range against the real installed version(s) (via the `semver` library),
+   suppressing a finding only when it can positively confirm the installed version doesn't fall
+   in any applicable advisory's range — never guessing, fails open (keeps the finding) whenever
+   the installed version or a range can't be resolved. See
+   `docs/REAL_WORLD_VALIDATION.md`'s "Fix status (bug 5)" section. Regression-tested:
+   `test/regression.test.js` and `test/fixtures/false-positives/24-vulnerable-dependency-boundary/`.
+
+`npm test`: 109/109 passing.
+
 ## Why this file exists
 
 This tool is aimed at people who did not write their own code and may not have the

@@ -105,6 +105,43 @@ const FIXED_FALSE_POSITIVE_CASES = [
     'eval-on-input',
     'RegExp.prototype.exec() validating a plugin name against an allowlist pattern',
   ],
+  // --- Round-2 real-world false-positive re-validation fixes (2026-07-24,
+  // docs/REAL_WORLD_VALIDATION.md "Re-validation (post-fix)" section) -- four NEW
+  // false-positive shapes surfaced on a fresh re-clone/re-scan of the same 20 repos after
+  // the first round of fixes above, all in secret-hardcoded-generic's generic-entropy/
+  // name-based heuristic path. See src/scanners/secrets.js's inline comments (search
+  // "Real-world FP fix (2026-07-24, docs/REAL_WORLD_VALIDATION.md re-validation") for the
+  // full reasoning behind each fix.
+  [
+    '25-real-world-secrets-round2',
+    'supabase-generated-types-fkey.ts',
+    'secret-hardcoded-generic',
+    'Bug A: auto-generated Supabase types.ts foreignKeyName constraint-name field (react-gantt-lovable-starter)',
+  ],
+  [
+    '25-real-world-secrets-round2',
+    'auto-generated-orm-constraint-name.ts',
+    'secret-hardcoded-generic',
+    'Bug A secondary signal: auto-generated-file header + a snake_case DB-identifier-shaped value on a non-"*KeyName" field',
+  ],
+  [
+    '25-real-world-secrets-round2',
+    'config-array-bare-key.js',
+    'secret-hardcoded-generic',
+    'Bug B: bare, standalone `key` property name in a plain config array (career-ops)',
+  ],
+  [
+    '25-real-world-secrets-round2',
+    'env-example-non-english.md',
+    'secret-hardcoded-generic',
+    'Bug C: non-English (Portuguese) placeholder value inside a README fenced code block (doutor-tabajara)',
+  ],
+  [
+    '25-real-world-secrets-round2',
+    'flask-self-attribute-references.py',
+    'secret-hardcoded-generic',
+    'Bug D: self.access_key/self.secret_key dotted attribute references passed as kwargs (Vibelens, Python/Flask)',
+  ],
 ];
 
 for (const [subfolder, filename, checkId, description] of FIXED_FALSE_POSITIVE_CASES) {
@@ -178,6 +215,46 @@ const POSITIVE_CONTROL_CASES = [
     'indirect-cp-wrapper.js',
     'eval-on-input',
     'child_process.exec() reached via a same-file helper function (const cp = getChildProcessModule()) with interpolated request input must still be flagged',
+  ],
+  // --- Round-2 real-world false-positive re-validation: overcorrection guards -----------
+  // Each of the four round-2 fixes above (Bugs A-D) only ever narrows an EXISTING
+  // suppression path further -- these confirm none of them accidentally swallow a genuine
+  // secret in the process.
+  [
+    '25-real-world-secrets-round2',
+    '_control-real-secret-in-generated-file-still-fires.ts',
+    'secret-hardcoded-generic',
+    'Bug A: a real high-entropy secret (not a snake_case DB identifier) inside an auto-generated-labeled file must still be flagged',
+  ],
+  [
+    '25-real-world-secrets-round2',
+    '_control-bare-key-real-secret-still-fires.js',
+    'secret-hardcoded-generic',
+    'Bug B: a bare `key` property name with a genuinely high-entropy, digit-bearing value must still be flagged',
+  ],
+  [
+    '25-real-world-secrets-round2',
+    '_control-secret-in-readme-fence-still-fires.md',
+    'secret-hardcoded-generic',
+    'Bug C: a real-looking secret pasted into a README fenced code block must still be flagged (the placeholder suppression is shape-scoped, not fence-scoped)',
+  ],
+  [
+    '25-real-world-secrets-round2',
+    '_control-non-english-placeholder-outside-doc-scope-still-fires.js',
+    'secret-hardcoded-generic',
+    'Bug C: the same word-shaped placeholder value must still fire OUTSIDE a Markdown doc-fence context (an ordinary .js source file)',
+  ],
+  [
+    '25-real-world-secrets-round2',
+    '_control-dotted-jwt-secret-still-fires.env',
+    'secret-hardcoded-generic',
+    'Bug D: THE historical regression-guard case -- a genuine high-entropy secret containing literal dots (JWT/base64-shaped, digit-dense per-segment) must still be flagged, not misread as a self./this.-style code reference',
+  ],
+  [
+    '25-real-world-secrets-round2',
+    '_control-trailing-comma-dotted-secret-still-fires.py',
+    'secret-hardcoded-generic',
+    'Bug D: a real dotted high-entropy secret written in the same trailing-comma kwarg-line shape as the self.access_key fix must still be flagged',
   ],
 ];
 

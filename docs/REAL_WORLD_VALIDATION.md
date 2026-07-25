@@ -669,3 +669,65 @@ current high severity per GHSA-r5fr-rjxr-66jc et al.) — confirming the full
 `scanNpmAuditForPackageDir()` → `resolveInstalledVersions()` → `parseNpmAuditJson()` pipeline
 behaves correctly end to end against a real package and a real, currently-published CVE, not
 just the pure-function unit tests. `npm test`: 98/98 passing (93 prior + 5 new).
+
+## Fix status (bugs A-D) — four new `secret-hardcoded-generic` false-positive shapes from the re-validation pass
+
+The "Re-validation (post-fix)" section above (§1) named four *new* false-positive shapes that
+filled the gap left by the first round of secret-check fixes, all found on repos in the
+re-validation set (`react-gantt-lovable-starter`, `career-ops`, `doutor-tabajara`, `Vibelens`).
+All four are now fixed in `src/scanners/secrets.js`; see that file's own inline comments
+(search `Real-world FP fix (2026-07-24, docs/REAL_WORLD_VALIDATION.md re-validation`) for the
+full reasoning behind each. Summary:
+
+- **Bug A — auto-generated Supabase FK-constraint names (`react-gantt-lovable-starter`, 6
+  FP).** `foreignKeyName: "tasks_project_id_fkey"` inside an auto-generated `types.ts` read as
+  a high-entropy secret because the property name contains "Key" and the constraint-name value
+  is long/underscored enough to clear the entropy gate. Fixed with two complementary signals:
+  (a) a property/variable name ending in `KeyName`/`ConstraintName`/`IndexName` describes the
+  NAME of a database key, not a secret's VALUE — a structural signal that generalizes across
+  ORMs/codegens rather than a hardcoded list of specific field names; (b) a lower-confidence
+  secondary signal for files whose own header says they're generated (`automatically
+  generated`/`do not edit`/`@generated`), scoped narrowly to values that also look like a
+  snake_case database identifier, so a genuine secret accidentally checked into a generated
+  file still fires.
+- **Bug B — bare `key:` property names (`career-ops`, 3 FP).** `{ key: 'respondedToInterview',
+  ... }` — the bare English word "key" (unlike "secret"/"token"/"password"/"apikey") is highly
+  ambiguous, and the camelCase phrase value's Shannon entropy (~3.5 bits/char) turned out to
+  clear the general 3.0 threshold despite being an ordinary dictionary phrase, not randomness.
+  Fixed by requiring a stronger secondary signal specifically for a BARE `key` name (not
+  `apiKey`/`secretKey`/`accessKey`, which keep the general threshold): a stricter entropy bar
+  (4.0 bits/char) AND at least one digit, since real API keys/tokens drawn from a wide alphabet
+  virtually always contain a digit across 20+ characters and an English phrase virtually never
+  does.
+- **Bug C — non-English README placeholder text (`doutor-tabajara`, 1 FP).**
+  `GROQ_API_KEY=sua_chave_groq_aqui` (Portuguese for "your_groq_key_here") wasn't recognized by
+  `looksLikePlaceholder()`'s English-only vocabulary. Fixed with a language-agnostic SHAPE
+  signal instead of translating one more phrase: a value inside a Markdown/MDX fenced code
+  block, composed of 2+ underscore/hyphen-separated pure-lowercase-ASCII word chunks (no
+  digits, no case-mixing — the opposite shape of a real generated secret in any language), is
+  suppressed. Scoped to fenced doc-code-examples only, not prose or application source.
+- **Bug D — `self.access_key`-style attribute references not recognized (`Vibelens`, 7 FP).**
+  The original env-var-reference fix (this document's "Fix status (2026-07-24, same day)"
+  section, item 2) only recognized four hardcoded roots (`process.env.`/`import.meta.env.`/
+  `Deno.env.`/`Bun.env.`); Python's `self.access_key`/`self.secret_key` idiom doesn't start with
+  any of them. Per this task's own historical warning, broadening to "any dot-separated
+  identifier-shaped value" was already tried once and already reverted (it silently dropped a
+  real JWT/base64-shaped secret containing literal dots). Fixed with a genuinely different
+  signal: each dot-separated SEGMENT of the value is checked individually for low digit density
+  (`≤15%`) and few case transitions (`≤3`) — the shape of an ordinary identifier word
+  (`self`, `access_key`, `VITE_SUPABASE_KEY`) — rather than checking the value's root against a
+  fixed prefix list. A real secret's segments (e.g. `xK2mQ9pL4vR8tY1wZ3aB5cD7eF`) are digit-dense
+  and case-chaotic and fail this check, so the historical regression case
+  (`DB_ADMIN_SECRET=xK2m....gH0i....bC1d...`) was hand-verified to still fire before this fix
+  was considered done, per the task's explicit self-test requirement. A secondary fix (stripping
+  a trailing comma before the shape check) was needed for the real-world shape specifically —
+  `self.access_key` written as one Python kwarg per physical line inside a multi-line call
+  (`aws_access_key_id=self.access_key,`) is captured by the unquoted dotenv-shape regex WITH its
+  trailing comma attached, which would otherwise still defeat the per-segment check.
+
+**Regression coverage:** `test/fixtures/false-positives/25-real-world-secrets-round2/` — one
+false-positive fixture per bug (plus a second Bug-A fixture exercising the auto-generated-file
+secondary signal specifically) and six positive-control fixtures confirming none of the four
+fixes over-suppress a genuine secret, including a dedicated repro of the historical dot-secret
+regression case and a trailing-comma variant of it. Wired into `test/false-positives.test.js`.
+`npm test`: 109/109 passing (98 prior + 11 new).
