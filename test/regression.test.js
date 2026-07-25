@@ -332,6 +332,10 @@ for (const [filename, expectedCheckId, description] of ROUND3_SECRETS_CASES) {
 const ROUND3_FRESH_CASES = [
   ['11-no-semicolon-helper-call.js', 'insecure-random-token', 'Math.random() via a helper call assigned with no trailing semicolon'],
   ['12-destructured-createhash-import.js', 'weak-password-hashing', 'md5 hashing via a destructured `const { createHash } = require(\'crypto\')` import'],
+  ['13-ts-as-cast.ts', 'mass-assignment', 'req.body passed with a TS `as CreateUserDto` cast'],
+  ['13-nonnull-assertion.ts', 'mass-assignment', 'req.body passed with a TS `!` non-null assertion'],
+  ['13-spread-into-variable.js', 'mass-assignment', 'const data = { ...req.body }; Model.create(data)'],
+  ['15-bracket-req-query.js', 'open-redirect', 'res.redirect(req[\'query\'].next) bracket-notation source'],
 ];
 for (const [filename, expectedCheckId, description] of ROUND3_FRESH_CASES) {
   test(`evasion-attempts/22-round3-fresh-look-11-15/${filename}: ${expectedCheckId} still caught (${description})`, async () => {
@@ -340,6 +344,63 @@ for (const [filename, expectedCheckId, description] of ROUND3_FRESH_CASES) {
     assert.ok(hits.length >= 1, `expected ${expectedCheckId} to fire on ${filename} (${description}) -- a round-3 fresh-look fix may have regressed`);
   });
 }
+
+// Round-3 injection (checks 4-6) and authz/webhook (checks 7-9) evasion fixtures. The FP
+// controls that must stay clean (check4/5/6-fp-*, 07-*-ok, 08-*computed-var-ok) are asserted
+// in test/false-positives.test.js; here we assert the real gaps are now caught.
+const ROUND3_INJECTION_ROOT = path.join(EVASION_FIXTURES_ROOT, '20-round3-injection');
+const ROUND3_AUTHZ_ROOT = path.join(EVASION_FIXTURES_ROOT, '21-round3-authz-webhook');
+let round3InjectionFindings;
+let round3AuthzFindings;
+async function round3Injection() {
+  round3InjectionFindings = round3InjectionFindings || (await scanRepo(ROUND3_INJECTION_ROOT, { skip: ['git-history', 'dependencies'] }));
+  return round3InjectionFindings;
+}
+async function round3Authz() {
+  round3AuthzFindings = round3AuthzFindings || (await scanRepo(ROUND3_AUTHZ_ROOT, { skip: ['git-history', 'dependencies'] }));
+  return round3AuthzFindings;
+}
+
+const ROUND3_INJECTION_CASES = [
+  ['check4-bracket-call', 'sql-string-concatenation', 'db[\'query\'](`...${id}`) bracket method access'],
+  ['check4-ts-return-helper', 'sql-string-concatenation', 'a SQL builder helper with a TS return-type annotation'],
+  ['check4-ts-typed-var', 'sql-string-concatenation', 'a SQL string built into a TS-typed variable (const sql: string = ...)'],
+  ['check5-await-async-arrow', 'eval-on-input', 'eval(await buildExpression(req.body.code)) awaited async-arrow helper'],
+  ['check6-nullish-credentials', 'cors-wildcard-with-credentials', 'credentials: options.withCredentials ?? true'],
+  ['check6-static-field-origin', 'cors-wildcard-with-credentials', "wildcard origin in a class static field (static origin = '*')"],
+  ['check6-ts-typed-origin-var', 'cors-wildcard-with-credentials', 'wildcard origin in a TS-typed variable'],
+];
+for (const [dir, expectedCheckId, description] of ROUND3_INJECTION_CASES) {
+  test(`evasion-attempts/20-round3-injection/${dir}: ${expectedCheckId} still caught (${description})`, async () => {
+    const findings = await round3Injection();
+    const hits = findings.filter((f) => f.checkId === expectedCheckId && f.file.includes(`${dir}/`));
+    assert.ok(hits.length >= 1, `expected ${expectedCheckId} to fire in ${dir} (${description}) -- a round-3 injection fix may have regressed`);
+  });
+}
+
+const ROUND3_AUTHZ_CASES = [
+  ['07-admin-pagetoken-suppressed.js', 'missing-auth-middleware', 'a genuinely unauthed admin route whose handler body has a pageToken local (gap 7-A)'],
+  ['08-client-servicerole-concat.js', 'supabase-rls-disabled', "process.env['SUPABASE_' + 'SERVICE_ROLE_KEY'] split-literal computed key"],
+  ['08-client-servicerole-join.js', 'supabase-rls-disabled', "process.env[[...].join('_')] array-join computed key"],
+  ['09-stripe-webhook-bracket-body.js', 'stripe-webhook-unverified', "req['body'] bracket-notation body read"],
+  ['09-stripe-webhook-destructured-body.js', 'stripe-webhook-unverified', 'const { body } = req destructured body read'],
+];
+for (const [filename, expectedCheckId, description] of ROUND3_AUTHZ_CASES) {
+  test(`evasion-attempts/21-round3-authz-webhook/${filename}: ${expectedCheckId} still caught (${description})`, async () => {
+    const findings = await round3Authz();
+    const hits = findings.filter((f) => f.checkId === expectedCheckId && f.file.includes(filename));
+    assert.ok(hits.length >= 1, `expected ${expectedCheckId} to fire on ${filename} (${description}) -- a round-3 authz/webhook fix may have regressed`);
+  });
+}
+
+// 07-admin-array-single-middleware.js was a round-3 FALSE POSITIVE (a securely-guarded route
+// `router.get('/admin/audit-log', [requireAuth], handler)` flagged because the single-element
+// middleware array's identifier is followed by `]` not `,`, gap 7-B). Assert it's clean now.
+test('evasion-attempts/21-round3-authz-webhook/07-admin-array-single-middleware.js: missing-auth-middleware does NOT fire (single-element [requireAuth] array, gap 7-B)', async () => {
+  const findings = await round3Authz();
+  const hits = findings.filter((f) => f.checkId === 'missing-auth-middleware' && f.file.includes('07-admin-array-single-middleware.js'));
+  assert.equal(hits.length, 0, `expected zero missing-auth-middleware findings -- the single-element middleware-array fix may have regressed. Found: ${JSON.stringify(hits)}`);
+});
 
 test('prompt-injection-variants: buildUserMessage() neutralizes every reachable injected tag/instruction', async () => {
   const findings = await scanRepo(PROMPT_INJECTION_ROOT);

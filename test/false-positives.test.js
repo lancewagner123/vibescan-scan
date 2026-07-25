@@ -98,6 +98,7 @@ const ROUND3_FALSE_POSITIVE_CASES = [
   ['20-round3-injection', 'check4-fp-parameterized-destructured', 'sql-string-concatenation', 'a parameterized query with destructured req.body params'],
   ['20-round3-injection', 'check5-fp-async-arrow-dispatch', 'eval-on-input', 'an eval-free async-arrow lookup-table dispatch'],
   ['20-round3-injection', 'check6-fp-static-config-method', 'cors-wildcard-with-credentials', 'a safe origin via a static config method returning a real domain'],
+  ['22-round3-fresh-look-11-15', '14-shorthand-and-spread.js', 'insecure-cookie-flags', 'ES6 shorthand { httpOnly, secure } and spread of a shared secure-defaults object'],
 ];
 
 for (const [folder, filename, checkId, description] of ROUND3_FALSE_POSITIVE_CASES) {

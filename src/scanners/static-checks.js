@@ -53,8 +53,18 @@ function snippetAt(text, index, len = 160) {
 // Case A: the unsafe concatenation/interpolation happens right inside the call, e.g.
 //   db.query(`SELECT * FROM x WHERE id = ${id}`)
 //   db.query("SELECT * FROM x WHERE id = '" + id + "'")
-const SQL_INLINE_TEMPLATE_RE = /\.(?:query|execute|raw)\s*\(\s*`[^`]*\$\{[^`]*\}[^`]*`/g;
-const SQL_INLINE_CONCAT_RE = /\.(?:query|execute|raw)\s*\(\s*(['"])(?:(?!\1).)*\1\s*\+\s*[A-Za-z_$][\w.$]*/g;
+// SQL_METHOD_ACCESS matches the query/execute/raw method either as ordinary dot access
+// (`.query`) OR as bracket/computed access (`['query']`) -- the round-3 injection audit
+// (gap 4a) found `db['query'](`...`)` completely invisible to the dot-only form.
+const SQL_METHOD_ACCESS = "(?:\\.(?:query|execute|raw)|\\[\\s*['\"](?:query|execute|raw)['\"]\\s*\\])";
+const SQL_INLINE_TEMPLATE_RE = new RegExp(`${SQL_METHOD_ACCESS}\\s*\\(\\s*\`[^\`]*\\$\\{[^\`]*\\}[^\`]*\``, 'g');
+const SQL_INLINE_CONCAT_RE = new RegExp(`${SQL_METHOD_ACCESS}\\s*\\(\\s*(['"])(?:(?!\\1).)*\\1\\s*\\+\\s*[A-Za-z_$][\\w.$]*`, 'g');
+
+// Builds the "variable VARNAME is passed to a .query/.execute/.raw call" usage regex,
+// tolerant of bracket/computed method access (gap 4a), shared by Case B and Case C.
+function buildSqlUsageRe(varName) {
+  return new RegExp(`${SQL_METHOD_ACCESS}\\s*\\(\\s*${varName}\\b`);
+}
 
 // Case B: the query string is built into a variable first, then that variable is passed
 // to the call later — just as common in real code, and missed entirely by Case A:
@@ -75,7 +85,9 @@ const SQL_KEYWORDS = '(?:SELECT|INSERT|UPDATE|DELETE)';
 // a real single-line string literal never spans multiple lines, which also keeps the
 // lazy loop bounded per-line instead of scanning unboundedly across the whole file.
 const SQL_BUILT_VAR_RE = new RegExp(
-  `(?:const|let|var)\\s+([A-Za-z_$][\\w$]*)\\s*=\\s*` +
+  // `(?::\\s*[^=;\\n]+?)?` tolerates a TS variable type annotation (gap 4c/systemic):
+  // `const sql: string = ...`.
+  `(?:const|let|var)\\s+([A-Za-z_$][\\w$]*)\\s*(?::\\s*[^=;\\n]+?)?\\s*=\\s*` +
     `(?:` +
     // template literal containing a SQL keyword and ${...} interpolation
     `\`[^\`]*\\b${SQL_KEYWORDS}\\b[^\`]*\\$\\{[^\`]*\\}[^\`]*\`` +
@@ -96,7 +108,10 @@ const SQL_BUILT_VAR_RE = new RegExp(
 // SQL_BUILT_VAR_RE (the concatenation is a `return` statement, not a `const/let/var =`)
 // ever see this. Requires a SQL keyword in the returned literal, same as SQL_BUILT_VAR_RE,
 // so this doesn't fire on unrelated string-building helpers.
-const FUNCTION_DECL_RE = /function\s+([A-Za-z_$][\w$]*)\s*\([^)]*\)\s*\{/g;
+// `(?::\s*[^{;]+)?` tolerates a TS return-type annotation before the body brace (gap 4b):
+// `function buildUserQuery(id): string {` -- mirrors the same tolerance lookupFunctionReturnExpr
+// already has.
+const FUNCTION_DECL_RE = /function\s+([A-Za-z_$][\w$]*)\s*\([^)]*\)\s*(?::\s*[^{;]+)?\{/g;
 const SQL_RETURN_BUILT_RE = new RegExp(
   `return\\s+` +
     `(?:` +
@@ -129,7 +144,7 @@ function findSqlTaintedCallSites(clean, original, fnNames) {
     while ((am = assignRe.exec(clean)) !== null) {
       const varName = am[1];
       const afterAssignment = clean.slice(assignRe.lastIndex);
-      const usageRe = new RegExp(`\\.(?:query|execute|raw)\\s*\\(\\s*${varName}\\b`);
+      const usageRe = buildSqlUsageRe(varName);
       if (usageRe.test(afterAssignment)) {
         hits.push({
           line: lineOfIndex(original, am.index),
@@ -162,7 +177,7 @@ function checkSqlStringConcatenation(clean, filePath, original) {
   while ((m = SQL_BUILT_VAR_RE.exec(clean)) !== null) {
     const varName = m[1];
     const afterAssignment = clean.slice(SQL_BUILT_VAR_RE.lastIndex);
-    const usageRe = new RegExp(`\\.(?:query|execute|raw)\\s*\\(\\s*${varName}\\b`);
+    const usageRe = buildSqlUsageRe(varName);
     if (usageRe.test(afterAssignment)) {
       hits.push({
         line: lineOfIndex(original, m.index),
@@ -203,8 +218,10 @@ function argLooksInterpolated(arg, clean) {
   // One level of inlining: if the argument is itself a same-file function call (e.g.
   // `eval(buildExpression(req.body.code))`), look up that function's own return
   // expression and test *that* instead of giving up just because the outer argument text
-  // contains parentheses.
-  const callMatch = trimmed.match(/^([A-Za-z_$][\w.$]*)\s*\(/);
+  // contains parentheses. A leading `await` is stripped first (gap 5a): an inlined
+  // async-arrow helper (`eval(await buildExpression(req.body.code))`) otherwise broke the
+  // call-expression anchor -- same normalization the open-redirect check already applies.
+  const callMatch = trimmed.replace(/^await\s+/, '').match(/^([A-Za-z_$][\w.$]*)\s*\(/);
   if (callMatch && clean) {
     const returnExpr = lookupFunctionReturnExpr(clean, callMatch[1]);
     if (returnExpr && argLooksInterpolated(returnExpr, null)) return true; // null: don't recurse a 2nd level
@@ -248,7 +265,12 @@ function checkEvalOnInput(clean, filePath, original) {
 // --- Check 6: cors-wildcard-with-credentials ------------------------------------------
 
 const CORS_WILDCARD_RE = /(?:origin\s*:\s*['"]\*['"]|Access-Control-Allow-Origin['"]?\s*[:,]\s*['"]\*['"])/gi;
-const CORS_CREDENTIALS_RE = /(?:credentials\s*:\s*true|Access-Control-Allow-Credentials['"]?\s*[:,]\s*['"]?true)/i;
+// The `credentials\s*:\s*[^,}]*(?:\?\?|\|\|)\s*true` alternative (gap 6c) recognizes
+// `credentials: options.withCredentials ?? true` / `... || true` -- a nullish/or default
+// that still resolves to true, which the literal-only form missed entirely so the whole
+// check short-circuited. Low FP risk: this only *enables* a finding, and only when a
+// wildcard origin is also present.
+const CORS_CREDENTIALS_RE = /(?:credentials\s*:\s*true|credentials\s*:\s*[^,}]*(?:\?\?|\|\|)\s*true|Access-Control-Allow-Credentials['"]?\s*[:,]\s*['"]?true)/i;
 
 // Wildcard-via-variable: `origin: someVar` where `someVar`'s own assignment can resolve
 // to '*' (a literal default via `||`/`??`, a ternary branch, etc.) is the same dangerous
@@ -258,10 +280,18 @@ const CORS_ORIGIN_VAR_RE = /origin\s*:\s*([A-Za-z_$][\w.$]*)\s*[,}]/gi;
 
 function findVarAssignmentContainingWildcard(clean, varName) {
   const escaped = varName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const re = new RegExp(`(?:const|let|var)\\s+${escaped}\\s*=\\s*([^;\\n]+)`, 'i');
+  // Direct same-file const/let/var declaration whose RHS textually contains a '*' literal
+  // (covers `const o = req.query.x || '*'`, ternaries, etc.). `(?::\s*[^=;\n]+?)?` tolerates
+  // a TS variable type annotation (gap 6b): `const allowedOrigin: string = '*'`.
+  const re = new RegExp(`(?:const|let|var)\\s+${escaped}\\s*(?::\\s*[^=;\\n]+?)?\\s*=\\s*([^;\\n]+)`, 'i');
   const m = clean.match(re);
-  if (!m) return null;
-  return /['"]\*['"]/.test(m[1]) ? m : null;
+  if (m && /['"]\*['"]/.test(m[1])) return m;
+  // Static class field / variable chain (gap 6a): `static origin = '*'` referenced as
+  // `CorsConfig.origin`, or a plain var hop -- resolveConcatExpression (util.js) resolves
+  // both a `ClassName.FIELD` static field and a const/let/var chain to their literal value.
+  const resolved = resolveConcatExpression(clean, varName);
+  if (resolved === '*') return { 0: `${varName} resolves to '*'`, index: 0 };
+  return null;
 }
 
 function checkCorsWildcardWithCredentials(clean, filePath, original) {
@@ -343,6 +373,12 @@ const SENSITIVE_PATH_PREFIX_RE = /^\/(?:admin|internal|_debug|internal-api)(?:\/
 const AUTH_KEYWORD_VOCAB = '(auth|session|token|jwt|passport|isAuthenticated|requireLogin|ensureAuth|verifyToken|apikey|api_key|authorize|authenticate)\\w*';
 const AUTH_KEYWORD_RE = new RegExp(`\\b${AUTH_KEYWORD_VOCAB}`, 'i');
 const AUTH_KEYWORD_AS_ARG_RE = new RegExp(`${AUTH_KEYWORD_VOCAB}\\s*,`, 'i');
+// Unanchored vocab match tested against an ALREADY-ISOLATED single middleware-argument
+// identifier (see routeArgsHaveAuthMiddleware). Because the candidate is one isolated
+// identifier, not a wide text window, a plain substring match can't spill into unrelated
+// surrounding code -- and camelCase names like `requireAuth` (no word boundary before
+// "Auth") are matched, which a `\b`-anchored version would miss.
+const AUTH_KEYWORD_IN_IDENT_RE = new RegExp(AUTH_KEYWORD_VOCAB, 'i');
 const AUTH_ENFORCEMENT_RE = /res\.(?:status\(\s*4(?:01|03)|sendStatus\(\s*4(?:01|03))|\bthrow\b/;
 const ROUTE_WINDOW_CHARS = 2000; // fallback lookahead window if the call's parens can't be balanced
 
@@ -361,15 +397,53 @@ function extractRouteCallText(clean, callIndex) {
   return extracted ? extracted.arg : null;
 }
 
+// Tests case (a) -- "is an auth-ish identifier passed as a MIDDLEWARE argument" -- against
+// only the middleware argument positions of a balanced route-registration call, NOT the
+// whole call text. The first argument (the route path literal/expression) is dropped, and
+// each remaining argument is considered only if it is a bare identifier or an array of
+// identifiers (`[requireAuth]` / `[requireAuth, requireAdmin]`); an inline handler
+// function/arrow is neither, so its BODY is never scanned here. This closes gap 7-A (a
+// handler-body local named with a vocab word mid-identifier -- `pageToken`, `sessionCount`
+// -- used to spuriously suppress a genuinely-unauthenticated route once AUTH_KEYWORD_AS_ARG_RE
+// was unanchored) and gap 7-B (a single-element middleware array `[requireAuth]`, whose
+// identifier is followed by `]` not `,`, went unrecognized) in one structural change --
+// scoping args-vs-body is the only thing that separates a real middleware arg (`requireAuth`)
+// from an identically-shaped handler-body local (`pageToken`).
+function routeArgsHaveAuthMiddleware(callText) {
+  const args = splitTopLevelArgs(callText);
+  // Consider every argument that is a bare identifier or an array of bare identifiers. A
+  // route path literal is a quoted string (or a `+`-concat expression) and an inline handler
+  // is an arrow/function -- neither is a bare identifier, so both are naturally excluded
+  // without special-casing argument position. This matters because argument position is not
+  // reliable: `router.get(path, requireAuth, handler)` has the middleware at index 1, but a
+  // chained `router.route(path).get(requireAuth, handler)` has it at index 0 (the `.get()`
+  // call carries no path argument at all). Not skipping the handler-function body is exactly
+  // what keeps a handler-body local named with a vocab word (`pageToken`) from suppressing a
+  // finding (gap 7-A) -- the function arg is not a bare identifier, so its body is never read.
+  for (const rawArg of args) {
+    const arg = rawArg.trim();
+    const inner = arg.replace(/^\[\s*/, '').replace(/\s*\]$/, ''); // unwrap a [ ... ] middleware array, if present
+    for (const el of inner.split(',')) {
+      const ident = el.trim();
+      if (/^[A-Za-z_$][\w$.]*$/.test(ident) && AUTH_KEYWORD_IN_IDENT_RE.test(ident)) return true;
+    }
+  }
+  return false;
+}
+
 function routeCallHasEnforcedAuth(clean, callIndex) {
-  const callText = extractRouteCallText(clean, callIndex)
-    || clean.slice(callIndex, Math.min(clean.length, callIndex + ROUTE_WINDOW_CHARS));
-  // (a) an auth-ish identifier passed as one of the arguments in the call itself, e.g.
+  const balanced = extractRouteCallText(clean, callIndex);
+  const callText = balanced || clean.slice(callIndex, Math.min(clean.length, callIndex + ROUTE_WINDOW_CHARS));
+  // (a) an auth-ish identifier passed as a middleware argument in the call itself, e.g.
   // router.get('/admin', requireAuth, (req, res) => {...}) -- real Express middleware
-  // wiring, not just the word "auth" appearing somewhere nearby (a decorative import, an
-  // unrelated log call, etc, which is exactly what used to slip past the old wide-window
-  // substring check).
-  if (AUTH_KEYWORD_AS_ARG_RE.test(callText)) return true;
+  // wiring. When we have a balanced call, restrict this to the actual middleware argument
+  // positions (routeArgsHaveAuthMiddleware); only fall back to the looser comma-based
+  // whole-text scan when the call's parens couldn't be balanced.
+  if (balanced) {
+    if (routeArgsHaveAuthMiddleware(balanced)) return true;
+  } else if (AUTH_KEYWORD_AS_ARG_RE.test(callText)) {
+    return true;
+  }
   // (b) the handler body actually terminates the request on failure (401/403/throw)
   // somewhere within the call.
   return AUTH_ENFORCEMENT_RE.test(callText);
@@ -541,7 +615,17 @@ const SERVICE_ROLE_RE = /SUPABASE_SERVICE_ROLE_KEY|service_role/;
 // inline a computed lookup, so whatever privileged env var name is being resolved here
 // only exists at runtime -- exactly the shape this evasion produces regardless of what
 // the resolved name turns out to be.
-const COMPUTED_ENV_ACCESS_RE = /process\.env\[\s*[A-Za-z_$][\w.$]*\s*\]/g;
+// Was `[A-Za-z_$][\w.$]*` -- a BARE identifier/member-chain key only, which missed the two
+// runtime-assembled shapes the check's own comment advertises defending against (round-3
+// authz audit, gaps 8-A/8-B): an array `.join()` key (`process.env[['SUPABASE','SERVICE',
+// 'ROLE','KEY'].join('_')]`, bracket content starts with `[`) and a split-literal concat
+// key (`process.env['SUPABASE_' + 'SERVICE_ROLE_KEY']`, content starts with a quote). Now
+// matches ANY `process.env[<expr>]` and the loop excludes only the single static quoted
+// literal case (`process.env['NAME']`), whose literal name the SERVICE_ROLE name search
+// already covers -- realigning the regex with the comment's stated "any computed access is
+// suspicious" intent.
+const COMPUTED_ENV_ACCESS_RE = /process\.env\[\s*([^\]]+?)\s*\]/g;
+const STATIC_ENV_KEY_LITERAL_RE = /^['"`][A-Za-z_$][\w]*['"`]$/;
 
 function looksLikeClientSideFile(filePath, clean) {
   const normalized = filePath.split(path.sep).join('/');
@@ -578,6 +662,10 @@ function checkSupabaseRlsDisabled(clean, filePath, original) {
     COMPUTED_ENV_ACCESS_RE.lastIndex = 0;
     let cm;
     while ((cm = COMPUTED_ENV_ACCESS_RE.exec(clean)) !== null) {
+      // A single static quoted literal (`process.env['NAME']`) is a plain named access, not
+      // a runtime-assembled key -- its literal name is already covered by the service_role
+      // name search above, so don't double-report it here.
+      if (STATIC_ENV_KEY_LITERAL_RE.test(cm[1].trim())) continue;
       hits.push({
         line: lineOfIndex(original, cm.index),
         snippet: snippetAt(original, cm.index),
@@ -605,6 +693,11 @@ function checkSupabaseRlsDisabled(clean, filePath, original) {
 const CATCH_BLOCK_START_RE = /\}\s*catch\s*(?:\([^)]*\))?\s*\{/g;
 const CATCH_ENFORCEMENT_RE = /\b(?:return|throw)\b|res\.(?:status\(\s*4|sendStatus\(\s*4)/;
 const FALLBACK_TO_RAW_BODY_RE = /=\s*[\w.$]+\s*\|\|\s*(?:JSON\.parse\s*\(\s*)?(?:req|request)\.body/;
+// Matches a request-body read in any of the three shapes real code uses -- dot access
+// (`req.body`/`request.body`), bracket/computed access (`req['body']`, gap 9-B), or object
+// destructuring straight off req/request (`const { body } = req` / `const { body: raw } =
+// request`, gap 9-A).
+const REQ_BODY_READ_RE = /(?:req|request)(?:\.body|\[\s*['"`]body['"`]\s*\])|(?:const|let|var)\s*\{[^}]*\bbody\b[^}]*\}\s*=\s*(?:req|request)\b/;
 const MAX_CATCH_SEARCH_DISTANCE = 500; // catch must belong to the SAME try, not some unrelated later one
 
 function extractCatchBlockAfter(clean, fromIndex) {
@@ -647,12 +740,17 @@ function checkStripeWebhookUnverified(clean, filePath, original) {
     ];
   }
 
-  // Anchor to the actual req.body/request.body match that made this a finding, not a
-  // generic `webhook` word search -- the file's first "webhook" substring can land
-  // anywhere (a route path, an import, an unrelated SQL table name like
-  // `webhook_events` on a completely different line/statement) and previously produced
-  // a finding that pointed at code with no real connection to the unverified-body read.
-  const rawBodyMatch = clean.match(/req\.body|request\.body/);
+  // Anchor to the actual request-body read that made this a finding, not a generic
+  // `webhook` word search -- the file's first "webhook" substring can land anywhere (a
+  // route path, an import, an unrelated SQL table name like `webhook_events` on a
+  // completely different line/statement) and previously produced a finding that pointed at
+  // code with no real connection to the unverified-body read. REQ_BODY_READ_RE recognizes
+  // the body read via dot (`req.body`), bracket (`req['body']`, gap 9-B) OR destructuring
+  // (`const { body } = req` / `const { body: raw } = req`, gap 9-A) -- the same dot/bracket/
+  // destructure taint-source coverage check 13 already has, retrofitted here so two of the
+  // most common ways to read a request body no longer silently hide a payment-verification
+  // bypass.
+  const rawBodyMatch = clean.match(REQ_BODY_READ_RE);
   if (!rawBodyMatch) return [];
 
   const anchor = rawBodyMatch;
@@ -743,20 +841,41 @@ function resolveDestructuredReqSource(clean, varName) {
   return null;
 }
 
+// Strips trailing TypeScript type assertions from an argument before the mass-assignment
+// branches inspect it (round-3 fresh-look, gaps #2/#3): a `as` cast (`req.body as
+// CreateUserDto`) and a non-null assertion (`req.body!`) are both extremely common,
+// idiomatic TS and both a runtime no-op for this purpose, but each defeated the exact-text/
+// bare-identifier branches, hiding the whole-object pass-through. Order: strip a trailing
+// `as Type` first, then any trailing `!`.
+function stripTsAssertions(text) {
+  let t = text.trim();
+  t = t.replace(/\s+as\s+[A-Za-z_$][\w$.<>[\]| ]*$/, '');
+  t = t.replace(/!+$/, '');
+  return t.trim();
+}
+
+// True if `text` is a spread-only object literal (`{ ...req.body }` / `{ ...someVar }`)
+// whose spread target resolves back to req.body/req.query -- shared by the inline-arg case
+// and the resolved-identifier case (`const data = { ...req.body }; Model.create(data)`,
+// gap #4), where resolveIdentifierChain returns the terminal spread literal that then needs
+// this same check rather than a bare isReqBodyOrQueryExpr test.
+function spreadOnlyOfReqSource(clean, text) {
+  const spreadMatch = text.trim().match(/^\{\s*\.\.\.\s*([A-Za-z_$][\w.$]*)\s*\}$/);
+  if (!spreadMatch) return false;
+  const spreadTarget = spreadMatch[1];
+  if (isReqBodyOrQueryExpr(spreadTarget)) return true;
+  if (/^[A-Za-z_$][\w$]*$/.test(spreadTarget)) {
+    const resolved = resolveIdentifierChain(clean, spreadTarget);
+    if (resolved && isReqBodyOrQueryExpr(resolved)) return true;
+  }
+  return false;
+}
+
 function argIsWholeReqBodyOrQuery(arg, clean) {
-  const trimmed = arg.trim();
+  const trimmed = stripTsAssertions(arg);
   if (isReqBodyOrQueryExpr(trimmed)) return true;
 
-  const spreadMatch = trimmed.match(/^\{\s*\.\.\.\s*([A-Za-z_$][\w.$]*)\s*\}$/);
-  if (spreadMatch) {
-    const spreadTarget = spreadMatch[1];
-    if (isReqBodyOrQueryExpr(spreadTarget)) return true;
-    if (/^[A-Za-z_$][\w$]*$/.test(spreadTarget)) {
-      const resolved = resolveIdentifierChain(clean, spreadTarget);
-      if (resolved && isReqBodyOrQueryExpr(resolved)) return true;
-    }
-    return false;
-  }
+  if (spreadOnlyOfReqSource(clean, trimmed)) return true;
 
   // Prisma's entire write-call shape nests the actual payload one level down under a
   // `data:` key (`prisma.user.create({ data: req.body })` / `{ where, data: req.body }`)
@@ -774,6 +893,9 @@ function argIsWholeReqBodyOrQuery(arg, clean) {
   if (identMatch) {
     const resolved = resolveIdentifierChain(clean, trimmed);
     if (resolved && isReqBodyOrQueryExpr(resolved)) return true;
+    // The resolved terminal may itself be a spread-only object literal
+    // (`const data = { ...req.body }; Model.create(data)`, gap #4).
+    if (resolved && spreadOnlyOfReqSource(clean, resolved)) return true;
     if (resolveDestructuredReqSource(clean, trimmed)) return true;
   }
   return false;
@@ -861,6 +983,14 @@ const COOKIE_SENSITIVE_NAME_RE = new RegExp(`session|token|${COOKIE_AUTH_KEYWORD
 const COOKIE_SENSITIVE_VALUE_RE = new RegExp(`session|token|jwt|secret|${COOKIE_AUTH_KEYWORD_SRC}`, 'i');
 const HTTP_ONLY_TRUE_RE = /\bhttpOnly\s*:\s*true\b/i;
 const SECURE_TRUE_RE = /\bsecure\s*:\s*true\b/i;
+// ES6 shorthand property recognition (round-3 fresh-look, FP #9): `const secure = true;
+// res.cookie('sid', t, { httpOnly, secure })` -- fully-secure, idiomatic code that the
+// literal-`: true` regexes read as "missing both flags". A bare `httpOnly`/`secure` key
+// terminated by `,`/`}` (i.e. NOT followed by a `:`) is treated as present. `secure: false`
+// still reads as insecure (it's followed by `:`, so the shorthand regex doesn't match and
+// SECURE_TRUE_RE doesn't either).
+const HTTP_ONLY_SHORTHAND_RE = /\bhttpOnly\s*(?:,|\})/i;
+const SECURE_SHORTHAND_RE = /\bsecure\s*(?:,|\})/i;
 // A false-positive audit (round 2, 2026-07-24) found `secure: process.env.NODE_ENV ===
 // 'production'` -- a near-universal, textbook-correct Express idiom (secure in
 // production/HTTPS, not secure in local dev/plain HTTP, where a literal `secure:true`
@@ -940,6 +1070,22 @@ function resolveInlineCallOptionsArg(clean, optionsArg) {
   return /^\{/.test(stripped) ? stripped : null;
 }
 
+// Resolves every `...spreadVar` inside an options-object text to its own object-literal
+// declaration and appends the resolved text, so flag detection can see flags that live in a
+// spread-in defaults object (FP #10). Unresolvable spreads are left as-is (their absence
+// just means those flags aren't counted as present -- bail-rather-than-guess, consistent
+// with the rest of this check).
+function expandSpreadsInOptions(clean, optionsText) {
+  let expanded = optionsText;
+  const spreadRe = /\.\.\.\s*([A-Za-z_$][\w$]*)/g;
+  let sm;
+  while ((sm = spreadRe.exec(optionsText)) !== null) {
+    const resolved = resolveObjectLiteralVar(clean, sm[1]);
+    if (resolved) expanded += ` ${resolved}`;
+  }
+  return expanded;
+}
+
 function checkInsecureCookieFlags(clean, filePath, original) {
   const hits = [];
   RES_COOKIE_CALL_RE.lastIndex = 0;
@@ -995,8 +1141,14 @@ function checkInsecureCookieFlags(clean, filePath, original) {
       continue;
     }
 
-    const missingHttpOnly = !HTTP_ONLY_TRUE_RE.test(optionsText);
-    const missingSecure = !SECURE_TRUE_RE.test(optionsText) && !SECURE_ENV_CONDITIONAL_RE.test(optionsText);
+    // Expand any `...spreadVar` inside the options object by resolving the spread source to
+    // its own object-literal declaration and appending its text, so a shared secure-defaults
+    // object (`res.cookie('authToken', t, { ...COOKIE_DEFAULTS, maxAge })` where
+    // COOKIE_DEFAULTS = { httpOnly: true, secure: true }) is recognized as secure rather than
+    // flagged (round-3 fresh-look, FP #10 -- centralizing cookie defaults is best practice).
+    const flagText = expandSpreadsInOptions(clean, optionsText);
+    const missingHttpOnly = !HTTP_ONLY_TRUE_RE.test(flagText) && !HTTP_ONLY_SHORTHAND_RE.test(flagText);
+    const missingSecure = !SECURE_TRUE_RE.test(flagText) && !SECURE_ENV_CONDITIONAL_RE.test(flagText) && !SECURE_SHORTHAND_RE.test(flagText);
     if (missingHttpOnly || missingSecure) {
       const missing = [missingHttpOnly && 'httpOnly:true', missingSecure && 'secure:true'].filter(Boolean).join(' and ');
       hits.push({
@@ -1023,13 +1175,18 @@ const RES_REDIRECT_CALL_RE = /\bres\.redirect\s*\(/g;
 // attacker-influenced as `req.query.next` -- an attacker who omits the query param just
 // gets the default; one who supplies it gets forwarded to it -- but the extra `?.`/`??`
 // punctuation defeated the old exact-match regex entirely.
-const REQ_SOURCE_PROP_RE = /^req\.(?:query|body|params)(?:\??\.[\w$]+)?(?:\s*\?\?\s*.+)?$/;
+// Bracket/computed access support added round-3 (fresh-look, gap #8): `req['query'].next`
+// -- check 13 already recognized `req['body']`, but that fix was never mirrored onto the
+// open-redirect taint source, an asymmetry between two checks that share the same
+// "req.query/body/params" concept. Both the `req` root and the trailing property may now be
+// written as dot OR bracket access.
+const REQ_SOURCE_PROP_RE = /^req(?:\.(?:query|body|params)|\[\s*['"`](?:query|body|params)['"`]\s*\])(?:\??\.[\w$]+|\[\s*['"`][\w$]+['"`]\s*\])?(?:\s*\?\?\s*.+)?$/;
 // Looser than REQ_SOURCE_PROP_RE: matches a req.query/body/params reference ANYWHERE in an
 // arbitrary expression, not just as the expression's entire text -- needed for the
 // function-return-expression case just below, where the resolved expression is often a
 // short-circuit chain (`req.query.next || req.query.returnTo`) rather than a single bare
 // property access.
-const REQ_SOURCE_PROP_ANYWHERE_RE = /\breq\.(?:query|body|params)\b/;
+const REQ_SOURCE_PROP_ANYWHERE_RE = /\breq(?:\.(?:query|body|params)\b|\[\s*['"`](?:query|body|params)['"`]\s*\])/;
 
 // Normalizes a res.redirect() target argument's raw text before any of the resolution
 // branches below see it -- two round-2 evasion-audit findings (2026-07-24) turned out to
