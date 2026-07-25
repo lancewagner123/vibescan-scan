@@ -618,3 +618,54 @@ true. One new, real, previously-undocumented bug (`vulnerable-dependency`'s incl
 comparison) and one narrower-than-intended fix (`self.X`-shaped variable references not covered
 by the "env-var reference" guard) surfaced as a direct result of doing this measurement
 honestly — recorded here rather than smoothed over, consistent with why this exercise exists.
+
+## Fix status (bug 5) — `vulnerable-dependency` version-boundary comparison
+
+**Investigated and fixed.** Per this section's own item 4, the specific instinct at the time
+was "a `<=`-range comparison that's inclusive of the *patched* version itself" — framed as a
+hand-rolled string-comparison bug. On investigation (re-running real `npm audit --json`
+against `brace-expansion@1.1.12` and `postcss@8.4.31` pinned exactly, today), that specific
+diagnosis doesn't hold: `src/scanners/dependencies.js` never contained any custom semver
+range-comparison logic at all — `parseNpmAuditJson()` reported a finding whenever a package
+name appeared as a key in `npm audit`'s own `vulnerabilities` object with severity high/
+critical, fully trusting npm's own aggregate determination with zero independent
+verification. Re-running real `npm audit` against those two exact package/version pins today
+shows npm's own per-advisory range math is correct (both packages are, as of today's live
+advisory data, genuinely still vulnerable to *newer* CVEs unrelated to the original ones —
+the registry has moved on since the validation pass that reported this). Per this document's
+own instruction to "confirm whether this is a bug in how VibeScan interprets npm audit's own
+output (most likely) versus a bug in npm audit itself (unlikely, but confirm)": neither,
+exactly — closer to "VibeScan performed zero independent verification of npm's aggregate at
+all," a real architectural gap even though no reproducible boundary bug could be pinned to a
+specific existing line.
+
+**Fix implemented anyway, because the gap is real:** `dependencies.js` now resolves the
+actual installed version(s) of each flagged package from the lockfile that was really
+audited (`resolveInstalledVersions()`, handles both lockfileVersion 2/3's `packages` map and
+legacy lockfileVersion 1's nested `dependencies` tree, including multiple undeduped copies of
+the same package at different nested locations), and cross-checks each advisory's own `via[]`
+range against those versions using the real `semver` library's range parser — rather than
+trusting npm's package-level `severity`/`range` aggregate blindly. A finding is only
+suppressed when this check can *positively* confirm non-applicability for every advisory that
+produced the aggregate; if the installed version can't be resolved, or a range string doesn't
+parse, the original finding is kept (fail open, never silently drop a real vulnerability).
+This directly closes the false-positive shape described above ("installed version is the
+patched release itself") for any case where it does occur — via `npm audit` data quality
+issues, multi-copy resolution edge cases, or future npm CLI behavior — without needing to
+reproduce the exact historical Vibelens scenario, which is no longer reproducible against the
+live registry.
+
+**Regression coverage:** `test/regression.test.js` — three deterministic, network-free unit
+tests exercising `parseNpmAuditJson()`'s boundary logic directly with a controlled advisory
+range and controlled installed-version data (confirms exact-patched-version suppression,
+confirms one-version-below still fires, confirms "no installed-version data available" fails
+open rather than suppressing), one unit test on `resolveInstalledVersions()` against a
+constructed lockfileVersion 3 fixture (confirms correct name recovery including scoped
+packages and multiple undeduped nested copies), and one real-network integration test against
+`test/fixtures/false-positives/24-vulnerable-dependency-boundary/` — two nested
+`package.json` files pinning `lodash` at its real current patched release (`4.18.1`, per
+`npm audit`'s own `fixAvailable` recommendation) and one release below (`4.17.21`, real
+current high severity per GHSA-r5fr-rjxr-66jc et al.) — confirming the full
+`scanNpmAuditForPackageDir()` → `resolveInstalledVersions()` → `parseNpmAuditJson()` pipeline
+behaves correctly end to end against a real package and a real, currently-published CVE, not
+just the pure-function unit tests. `npm test`: 98/98 passing (93 prior + 5 new).

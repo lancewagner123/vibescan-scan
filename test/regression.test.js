@@ -454,7 +454,7 @@ test('evasion-attempts/23-supabase-rls-sql/reservations-scoped-policy.sql: supab
 // because the full check-10 path needs npm + live network (too flaky to gate CI on). The
 // scenario-6 id-collision fix and the defect-B warning-attribution fix are both pure
 // functions of their inputs, so they're tested directly.
-const { parseNpmAuditJson, describeInstallFailure } = require('../src/scanners/dependencies');
+const { parseNpmAuditJson, describeInstallFailure, resolveInstalledVersions } = require('../src/scanners/dependencies');
 
 test('dependencies.js scenario 6: the same CVE in two different package.json files gets DISTINCT finding ids', () => {
   // Minimal npm-audit-shaped JSON with one high-severity advisory.
@@ -499,6 +499,147 @@ test('dependencies.js defect B: temp-install failure warning attributes the actu
     /unknown/i,
     'an unclassifiable failure must say the cause is unknown, not assert a specific one'
   );
+});
+
+// --- Round 4 dependency-check (check 10) version-boundary fix -------------------------
+// docs/REAL_WORLD_VALIDATION.md's "Re-validation (post-fix)" pass (item 4) found a real
+// false positive on a live repo (Vibelens): brace-expansion and postcss were both flagged
+// even though the versions actually resolved in the lockfile were the PATCHED releases
+// themselves, not versions preceding the patch -- npm audit's per-package `vulnerabilities`
+// entry aggregates every advisory that has ever applied to a package name into one top-level
+// severity/range, and parseNpmAuditJson() used to trust that aggregate without ever checking
+// it against the actually-resolved installed version. These two tests are deterministic and
+// network-free (unlike the full check-10 path), following the same style as the scenario-6/
+// defect-B tests above -- they exercise the boundary comparison logic itself directly, so
+// they hold regardless of how the live npm advisory database changes over time (see the
+// real-network integration fixture further below for the "real package, real registry" half
+// of this fix's coverage).
+test('dependencies.js round-4 boundary fix: a dependency pinned EXACTLY at its patched version is NOT flagged, even though npm audit\'s own aggregate range still nominally includes it', () => {
+  // Deliberately shaped like the real npm audit output for a package with a single advisory
+  // whose fix landed at 1.1.12: the top-level range ("<=1.1.11") is the inclusive-of-last-
+  // vulnerable-version form npm sometimes reports, and the one `via` entry gives the actual
+  // advisory boundary ("<1.1.12", exclusive of the patched release). The installed version
+  // resolved from the lockfile is 1.1.12 -- the patched release itself.
+  const auditJson = JSON.stringify({
+    vulnerabilities: {
+      'brace-expansion': {
+        severity: 'high',
+        range: '<=1.1.11',
+        via: [{ title: 'ReDoS in brace-expansion', severity: 'high', range: '<1.1.12' }],
+      },
+    },
+  });
+  const warnings = [];
+  const installedVersions = new Map([['brace-expansion', new Set(['1.1.12'])]]);
+  const findings = parseNpmAuditJson(auditJson, warnings, 'package.json', installedVersions);
+
+  assert.equal(
+    findings.length,
+    0,
+    'a package pinned exactly at its patched version must not be flagged, even when npm\'s own top-level aggregate range nominally still includes it -- ' +
+      `got: ${JSON.stringify(findings)}`
+  );
+});
+
+test('dependencies.js round-4 boundary fix: the SAME advisory still fires when the installed version is one release below the patch (positive control)', () => {
+  const auditJson = JSON.stringify({
+    vulnerabilities: {
+      'brace-expansion': {
+        severity: 'high',
+        range: '<=1.1.11',
+        via: [{ title: 'ReDoS in brace-expansion', severity: 'high', range: '<1.1.12' }],
+      },
+    },
+  });
+  const warnings = [];
+  const installedVersions = new Map([['brace-expansion', new Set(['1.1.11'])]]);
+  const findings = parseNpmAuditJson(auditJson, warnings, 'package.json', installedVersions);
+
+  assert.equal(findings.length, 1, 'a genuinely vulnerable pinned version must still be flagged -- the fix must not over-suppress');
+  assert.equal(findings[0].severity, 'high');
+});
+
+test('dependencies.js round-4 boundary fix: when the installed version can\'t be resolved at all, the original finding is kept (fail open, not silently dropped)', () => {
+  const auditJson = JSON.stringify({
+    vulnerabilities: {
+      'brace-expansion': {
+        severity: 'high',
+        range: '<=1.1.11',
+        via: [{ title: 'ReDoS in brace-expansion', severity: 'high', range: '<1.1.12' }],
+      },
+    },
+  });
+  const warnings = [];
+  // No installedVersionsByPkg map at all (undefined) -- same call shape as the pre-fix
+  // scenario-6/defect-B tests above, and the shape used whenever the lockfile itself
+  // couldn't be read/parsed. Must fall back to trusting npm's own aggregate, never suppress.
+  const findingsNoMap = parseNpmAuditJson(auditJson, warnings, 'package.json');
+  assert.equal(findingsNoMap.length, 1, 'with no installed-version data at all, the finding must be kept, not dropped');
+
+  // A map that exists but has no entry for this package (couldn't be resolved from the
+  // lockfile for some reason) must behave the same way.
+  const findingsEmptyMap = parseNpmAuditJson(auditJson, warnings, 'package.json', new Map());
+  assert.equal(findingsEmptyMap.length, 1, 'with an installed-version map that has no entry for this package, the finding must be kept, not dropped');
+});
+
+test('dependencies.js round-4 boundary fix: resolveInstalledVersions() correctly reads a real lockfileVersion 3 package-lock.json, including nested/undeduped copies', () => {
+  const fs = require('node:fs');
+  const os = require('node:os');
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'vibescan-lockfile-test-'));
+  const lockfilePath = path.join(tmpDir, 'package-lock.json');
+  fs.writeFileSync(
+    lockfilePath,
+    JSON.stringify({
+      name: 'fixture',
+      version: '1.0.0',
+      lockfileVersion: 3,
+      requires: true,
+      packages: {
+        '': { name: 'fixture', version: '1.0.0' },
+        'node_modules/brace-expansion': { version: '2.0.2' },
+        // A nested, undeduped older copy -- both must be captured, since the package is
+        // genuinely vulnerable if EITHER resolved copy falls in an advisory's range.
+        'node_modules/old-dep/node_modules/brace-expansion': { version: '1.1.10' },
+        'node_modules/@scope/pkg': { version: '3.1.4' },
+      },
+    })
+  );
+
+  const versions = resolveInstalledVersions(lockfilePath);
+  assert.deepEqual([...versions.get('brace-expansion')].sort(), ['1.1.10', '2.0.2']);
+  assert.deepEqual([...versions.get('@scope/pkg')].sort(), ['3.1.4']);
+
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+});
+
+// Real-network integration coverage (needs npm + a live registry, same as the rest of check
+// 10): a fixture with two nested package.json files, one pinning lodash at its current
+// patched release (4.18.1) and one pinning it one release below (4.17.21, still within
+// npm's real, currently-published vulnerable range). This is the "real package.json +
+// lockfile, real CVE, real patched version" fixture the round-4 fix work asked for --
+// exercises the full scanNpmAuditForPackageDir() -> resolveInstalledVersions() ->
+// parseNpmAuditJson() pipeline end to end, not just the pure function in isolation above.
+test('fixtures/false-positives/24-vulnerable-dependency-boundary: a real dependency pinned at its real patched version is not flagged, while the same dependency one version below still is', async () => {
+  const fixtureRoot = path.join(__dirname, 'fixtures', 'false-positives', '24-vulnerable-dependency-boundary');
+  const findings = await scanRepo(fixtureRoot);
+  const depFindings = findings.filter((f) => f.checkId === 'vulnerable-dependency');
+
+  const patched = depFindings.filter((f) => f.file.includes('patched-exact'));
+  const vulnerable = depFindings.filter((f) => f.file.includes('vulnerable-one-below'));
+
+  assert.equal(
+    patched.length,
+    0,
+    'lodash@4.18.1 (patched-exact/) must not be flagged -- ' +
+      `got: ${JSON.stringify(patched)}. If this fails because lodash has since moved its patched version again, ` +
+      're-check the current fix version with `npm audit` and update both fixture package.json files to match.'
+  );
+  assert.ok(
+    vulnerable.length >= 1,
+    'lodash@4.17.21 (vulnerable-one-below/) must still be flagged (positive control) -- ' +
+      `found checkIds: ${JSON.stringify(findings.filter((f) => f.file && f.file.includes('vulnerable-one-below')).map((f) => f.checkId))}`
+  );
+  assert.equal(vulnerable[0].severity, 'high');
 });
 
 test('prompt-injection-variants: buildUserMessage() neutralizes every reachable injected tag/instruction', async () => {

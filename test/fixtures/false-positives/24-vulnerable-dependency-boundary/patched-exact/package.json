@@ -1,0 +1,9 @@
+{
+  "name": "boundary-fixture-patched-exact",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Round-4 real-world-validation regression fixture (docs/REAL_WORLD_VALIDATION.md, 'Re-validation (post-fix)', item 4): lodash pinned EXACTLY at its current patched release (4.18.1, per `npm audit`'s own fixAvailable recommendation at the time this fixture was built). Before the fix, dependencies.js trusted npm audit's per-package aggregate `severity`/`range` blindly and never cross-checked it against the actual resolved installed version -- this fixture (paired with vulnerable-one-below/) proves the check no longer flags a dependency that is genuinely, already patched. See test/regression.test.js.",
+  "dependencies": {
+    "lodash": "4.18.1"
+  }
+}

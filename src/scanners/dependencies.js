@@ -10,10 +10,12 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { execFileSync } = require('child_process');
+const semver = require('semver');
 const { makeId, walkFiles } = require('./util');
 
 const CHECK_ID = 'vulnerable-dependency';
 const NPM_SEVERITIES_TO_REPORT = new Set(['high', 'critical']);
+const SEVERITY_RANK = { info: 0, low: 1, moderate: 2, high: 3, critical: 4 };
 
 // On Windows, `npm` resolves to `npm.cmd` (a batch file) — execFileSync spawns via
 // CreateProcess directly and can't launch a .cmd without going through a shell, so
@@ -97,7 +99,126 @@ function extractAdvisoryTitles(via) {
     .filter(Boolean);
 }
 
-function parseNpmAuditJson(raw, warnings, fileForId) {
+// Round-4 real-world validation (docs/REAL_WORLD_VALIDATION.md, "Re-validation (post-fix)",
+// item 4) surfaced a genuine false-positive shape on a real repo: `npm audit`'s per-package
+// entry in `vulnerabilities` aggregates EVERY advisory that has ever applied to that package
+// name across its whole version history into one top-level `severity`/`range`, and
+// parseNpmAuditJson() used to trust that aggregate blindly -- it never checked whether the
+// package's ACTUAL resolved installed version (from the lockfile) still falls inside any of
+// those advisories' own ranges. A package can appear as a `vulnerabilities` key with
+// severity "high" while the specific version genuinely installed sits outside every one of
+// the individual advisory ranges that produced that aggregate (npm still lists the entry
+// because a *different* resolved copy elsewhere in the tree is the one that's vulnerable, or
+// because of an aggregation edge case) -- reporting it anyway is exactly the "installed
+// version is the patched release itself" false positive the validation exercise found.
+//
+// Fix: resolve the real installed version(s) for the package from the lockfile that was
+// actually audited, and cross-check each advisory's own `range` string against those
+// versions using semver's own range parser (correct `<` vs `<=` handling, not a hand-rolled
+// string comparison that could get the boundary wrong). Only suppress a finding when this
+// check can *positively confirm* non-applicability for every advisory in `via` -- if we can't
+// resolve an installed version, or a range string doesn't parse, fall back to npm's own
+// aggregate determination rather than risk silently dropping a real vulnerability. See
+// resolveInstalledVersions() and filterApplicableAdvisories() below.
+
+// Reads a package-lock.json/npm-shrinkwrap.json and returns a Map of package name ->
+// Set of every version actually resolved for that name anywhere in the tree (a package can
+// legitimately be installed at multiple versions simultaneously via nested/undeduped
+// transitive copies -- e.g. brace-expansion@1.1.12 at the top level and an older
+// brace-expansion@1.1.10 nested under some other dependency's own node_modules -- and ALL of
+// them matter: the package is genuinely vulnerable if ANY resolved copy falls in an
+// advisory's range, not just the top-level one).
+function resolveInstalledVersions(lockfilePath) {
+  const versionsByName = new Map();
+  const addVersion = (name, version) => {
+    if (!name || typeof version !== 'string' || !version) return;
+    if (!versionsByName.has(name)) versionsByName.set(name, new Set());
+    versionsByName.get(name).add(version);
+  };
+
+  let parsed;
+  try {
+    parsed = JSON.parse(fs.readFileSync(lockfilePath, 'utf8'));
+  } catch {
+    return versionsByName;
+  }
+
+  // lockfileVersion 2/3 (npm 7+): flat "packages" map keyed by node_modules path, e.g.
+  // "node_modules/brace-expansion" or "node_modules/foo/node_modules/brace-expansion" for a
+  // nested/undeduped copy. The package name is everything after the LAST "node_modules/"
+  // segment, which correctly recovers scoped names too (node_modules/@scope/name).
+  if (parsed.packages && typeof parsed.packages === 'object') {
+    for (const [pkgPath, meta] of Object.entries(parsed.packages)) {
+      if (!pkgPath || !meta || typeof meta.version !== 'string') continue;
+      const marker = 'node_modules/';
+      const idx = pkgPath.lastIndexOf(marker);
+      if (idx === -1) continue;
+      addVersion(pkgPath.slice(idx + marker.length), meta.version);
+    }
+  }
+
+  // lockfileVersion 1 (legacy npm 5/6, still occasionally seen): nested "dependencies" tree.
+  // Also present as a redundant legacy mirror alongside "packages" in v2 lockfiles, so this
+  // safely runs in addition to the block above rather than instead of it.
+  if (parsed.dependencies && typeof parsed.dependencies === 'object') {
+    const walk = (deps) => {
+      for (const [name, meta] of Object.entries(deps)) {
+        if (!meta) continue;
+        addVersion(name, meta.version);
+        if (meta.dependencies && typeof meta.dependencies === 'object') walk(meta.dependencies);
+      }
+    };
+    walk(parsed.dependencies);
+  }
+
+  return versionsByName;
+}
+
+// Given one advisory's `via` array and the set of versions actually resolved for this
+// package, returns { applicable, confident }:
+//   - confident: true only if EVERY object-shaped via entry's applicability could be
+//     positively determined (its range parsed, and at least one installed version resolved).
+//     False otherwise -- meaning "don't trust this narrowing, fall back to npm's aggregate."
+//   - applicable: the subset of via entries that genuinely apply to a resolved installed
+//     version (only meaningful when confident is true).
+function filterApplicableAdvisories(viaEntries, installedVersions) {
+  const objectEntries = viaEntries.filter((v) => v && typeof v === 'object');
+  if (objectEntries.length === 0 || !installedVersions || installedVersions.size === 0) {
+    return { applicable: objectEntries, confident: false };
+  }
+
+  const applicable = [];
+  for (const entry of objectEntries) {
+    if (typeof entry.range !== 'string' || !semver.validRange(entry.range)) {
+      // Can't parse this advisory's range at all -- don't guess, defer to npm's aggregate.
+      return { applicable: objectEntries, confident: false };
+    }
+    let matched = false;
+    for (const rawVersion of installedVersions) {
+      const version = semver.valid(rawVersion) ? rawVersion : semver.coerce(rawVersion);
+      if (!version) continue;
+      if (semver.satisfies(version, entry.range, { includePrerelease: true })) {
+        matched = true;
+        break;
+      }
+    }
+    if (matched) applicable.push(entry);
+  }
+
+  return { applicable, confident: true };
+}
+
+function maxSeverity(entries, fallback) {
+  let best = null;
+  for (const entry of entries) {
+    const s = entry && entry.severity;
+    if (!s) continue;
+    if (!best || (SEVERITY_RANK[s] || 0) > (SEVERITY_RANK[best] || 0)) best = s;
+  }
+  return best || fallback;
+}
+
+function parseNpmAuditJson(raw, warnings, fileForId, installedVersionsByPkg) {
   let parsed;
   try {
     parsed = JSON.parse(raw);
@@ -108,13 +229,41 @@ function parseNpmAuditJson(raw, warnings, fileForId) {
 
   const vulnerabilities = parsed.vulnerabilities || {};
   const findings = [];
+  const installedVersions = installedVersionsByPkg instanceof Map ? installedVersionsByPkg : new Map();
 
   for (const [pkgName, advisory] of Object.entries(vulnerabilities)) {
-    const severity = advisory.severity;
+    if (!NPM_SEVERITIES_TO_REPORT.has(advisory.severity)) continue;
+
+    const viaEntries = Array.isArray(advisory.via) ? advisory.via : [];
+    const { applicable, confident } = filterApplicableAdvisories(viaEntries, installedVersions.get(pkgName));
+
+    // Only narrow when we could POSITIVELY confirm applicability for every object-shaped
+    // advisory in `via` -- otherwise keep npm's own full aggregate (objectEntries filtered
+    // out of `applicable` above are dropped only when `confident` is true; when it's false,
+    // `filterApplicableAdvisories` already returns the unfiltered set).
+    const usableEntries = confident ? applicable : viaEntries.filter((v) => v && typeof v === 'object');
+    if (confident && applicable.length === 0) {
+      // Every advisory that produced this aggregate genuinely does not apply to any version
+      // of this package actually resolved in the lockfile -- e.g. the installed version is
+      // the patched release itself, not one preceding it. Suppress: this is the false
+      // positive shape docs/REAL_WORLD_VALIDATION.md's re-validation pass found on Vibelens
+      // (brace-expansion, postcss both pinned exactly on their own fix commit).
+      continue;
+    }
+
+    // Recompute severity from the entries we're actually reporting, not npm's blanket
+    // top-level aggregate -- if narrowing dropped the entry that carried the worst severity,
+    // the effective severity for what's left may now be lower (and could fall below the
+    // high/critical threshold entirely).
+    const severity = maxSeverity(usableEntries, advisory.severity);
     if (!NPM_SEVERITIES_TO_REPORT.has(severity)) continue;
 
-    const titles = extractAdvisoryTitles(advisory.via);
-    const rangeStr = advisory.range || 'unknown range';
+    // String-shaped via entries (a transitive reference to another vulnerable package's
+    // name, not an advisory object with its own range) carry no range to verify against this
+    // package directly -- always keep them in the message, same as before this fix.
+    const titleSource = viaEntries.filter((v) => typeof v === 'string' || usableEntries.includes(v));
+    const titles = extractAdvisoryTitles(titleSource);
+    const rangeStr = usableEntries.map((e) => e.range).filter(Boolean).join(' || ') || advisory.range || 'unknown range';
     const titleText = titles.length ? titles.join('; ') : `${pkgName} has a known ${severity} severity vulnerability`;
 
     findings.push({
@@ -162,9 +311,9 @@ function scanNpmAuditForPackageDir(pkgDir, repoPath, warnings) {
   const packageJsonPath = path.join(pkgDir, 'package.json');
   const repoRelPackageJson = path.relative(repoPath, packageJsonPath).split(path.sep).join('/');
 
-  const hasLockfile = LOCKFILE_NAMES.some((name) => fs.existsSync(path.join(pkgDir, name)));
+  const lockfileName = LOCKFILE_NAMES.find((name) => fs.existsSync(path.join(pkgDir, name)));
 
-  if (hasLockfile) {
+  if (lockfileName) {
     // A lockfile already exists — `npm audit` is read-only against it, so it's safe to
     // run directly in the target directory without touching anything.
     const result = runCaptureJson(NPM_BIN, ['audit', '--json'], pkgDir, 50 * 1024 * 1024, NPM_SHELL_OPT);
@@ -176,7 +325,8 @@ function scanNpmAuditForPackageDir(pkgDir, repoPath, warnings) {
       }
       return [];
     }
-    return parseNpmAuditJson(result.raw, warnings, repoRelPackageJson);
+    const installedVersions = resolveInstalledVersions(path.join(pkgDir, lockfileName));
+    return parseNpmAuditJson(result.raw, warnings, repoRelPackageJson, installedVersions);
   }
 
   // No lockfile committed (common for a freshly-scaffolded/AI-generated project that
@@ -211,7 +361,8 @@ function scanNpmAuditForPackageDir(pkgDir, repoPath, warnings) {
       warnings.push(`dependencies.js: npm audit failed to run against generated lockfile for ${repoRelPackageJson}: ${auditResult.err ? auditResult.err.message : 'unknown error'}`);
       return [];
     }
-    return parseNpmAuditJson(auditResult.raw, warnings, repoRelPackageJson);
+    const installedVersions = resolveInstalledVersions(path.join(tempDir, 'package-lock.json'));
+    return parseNpmAuditJson(auditResult.raw, warnings, repoRelPackageJson, installedVersions);
   } catch (err) {
     warnings.push(`dependencies.js: could not audit ${repoRelPackageJson} without a committed lockfile: ${err.message}`);
     return [];
@@ -329,7 +480,8 @@ function scan(repoPath, opts = {}) {
   return { findings, warnings };
 }
 
-// parseNpmAuditJson and describeInstallFailure are exported for deterministic, network-free
-// regression tests (the scenario-6 id-collision fix and the defect-B warning-attribution
-// fix) -- the full scan path needs npm + network, which is too flaky to assert on directly.
-module.exports = { scan, parseNpmAuditJson, describeInstallFailure };
+// parseNpmAuditJson, describeInstallFailure, and resolveInstalledVersions are exported for
+// deterministic, network-free regression tests (the scenario-6 id-collision fix, the defect-B
+// warning-attribution fix, and the round-4 version-boundary fix) -- the full scan path needs
+// npm + network, which is too flaky to assert on directly.
+module.exports = { scan, parseNpmAuditJson, describeInstallFailure, resolveInstalledVersions };

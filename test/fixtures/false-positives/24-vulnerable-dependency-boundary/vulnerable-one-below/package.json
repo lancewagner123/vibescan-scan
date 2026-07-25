@@ -1,0 +1,9 @@
+{
+  "name": "boundary-fixture-vulnerable-one-below",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Positive control for patched-exact/ (see that folder's package.json for the full explanation): lodash pinned at 4.17.21, one step below the 4.18.1 patched release, which real `npm audit` reports as high severity (GHSA-r5fr-rjxr-66jc et al., range <=4.17.23). Confirms the round-4 version-boundary fix doesn't over-suppress -- a genuinely vulnerable pin must still fire.",
+  "dependencies": {
+    "lodash": "4.17.21"
+  }
+}
