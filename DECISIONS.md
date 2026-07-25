@@ -622,3 +622,82 @@ README honesty gap (distinguish the 1-10 vs 11-15 confidence tiers; disclose the
 framework scope), then run VibeScan against 15-30 real public AI-generated repos and
 hand-triage every finding to measure the real-world false-positive rate. Publish once that
 number is known.
+
+## Real-world false-positive validation (20 real repos) (2026-07-24)
+
+Did exactly what the round-3 consultant asked instead of a round 4 of fixture hardening: 20
+real, public AI-generated repos (Lovable ×3, Bolt.new ×3, Claude Code ×1, v0.dev ×1, one
+dual-tagged, 8 profile-match "plausible," 3 included only for stack diversity with no AI-tool
+signal) were sourced via real GitHub search, cloned, scanned with `vibescan scan`, and every
+finding hand-triaged (file read, caller traced, real installed version resolved from the
+lockfile, real CVE/GHSA text checked where relevant) as TRUE_POSITIVE / FALSE_POSITIVE /
+UNCERTAIN. 2 of the 20 failed to produce a usable clone/scan result and were excluded; 1
+more (`1Flow`) turned out to be a README-only stub with no scannable code (0 findings, not a
+data point either way). 17 repos produced real triaged findings. Full writeup, per-checkId
+table, real false-positive patterns, and real true positives found: `docs/REAL_WORLD_VALIDATION.md`.
+
+**Headline numbers:** 253 findings triaged. 165 TRUE_POSITIVE (65.2%), 84 FALSE_POSITIVE
+(33.2%), 4 UNCERTAIN (1.6%). But the blended number hides the real story: **all 165 true
+positives came from exactly one check, `vulnerable-dependency`** (165/208 on that check
+alone, 79.3%) — **and every other check that fired at all was wrong 100% of the time**:
+`secret-hardcoded-generic` (0/16), `secret-env-committed` (0/2), `secret-git-history` (0/16),
+`eval-on-input` (0/7), `missing-auth-middleware` (0/3), `stripe-webhook-unverified` (0/1) — 45
+findings, 45 false positives, 0 true positives, across six different checks in six
+independently-sourced repos each. `sql-string-concatenation`, `cors-wildcard-with-credentials`,
+`supabase-rls-disabled`, and all five v0.2.0 checks (11-15) never fired once across all 20
+repos — no real-world evidence either way for nine of the fifteen checks.
+
+**Does this confirm the round-3 confidence-tier prediction ("1-10 HIGH, 11-15 MODERATE")?**
+No — it complicates it for the untested checks and directly contradicts it for six of the
+ten checks in the "1-10 HIGH" bucket. The dependency check earns "HIGH, believe it" on real
+evidence now, not just fixture-hardening. But `secret-hardcoded-generic`,
+`secret-env-committed`, `secret-git-history`, `eval-on-input`, `missing-auth-middleware`, and
+`stripe-webhook-unverified` — six of the nine non-dependency "1-10" checks — were wrong every
+single time they fired on real code. The dominant cause wasn't a broken regex (each matched
+exactly the shape it was designed to match) but a mismatch between "this shape exists" and
+"this shape is dangerous here": Supabase's `anon`/publishable key is designed by Supabase's
+own architecture to be public (RLS enforces access, not secrecy) and accounted for the
+majority of the secret-check false positives across independently-sourced repos;
+`RegExp.prototype.exec()` shares the substring `exec` with `child_process.exec`/`execSync`
+and repeatedly, wrongly tripped `eval-on-input`. The 11-15 "MODERATE, prone to false alarms
+on innocuous names" prediction is still untested, not confirmed — none of those five checks
+fired on any of the 20 repos.
+
+One genuine miss surfaced during triage, not itself a VibeScan finding: a Bolt.new
+reservation app had a real Supabase RLS policy granting the public `anon` role unrestricted
+`SELECT` on a table of guest names/emails/phone numbers — exactly what check 8 exists to
+catch — and check 8 never flagged it (its current pattern covers config/table-definition
+text and a `service_role` key in client code, not an overly-permissive policy body in a
+migration file). Recorded as an honest false-negative, not counted in the FP-rate math.
+
+**Does the premise hold up?** Partially, and worth being honest about both halves. Every real
+vulnerability found in this sample was an outdated dependency — several genuinely serious,
+including a Next.js middleware-authorization-bypass CVE match in an app that was actually
+using Next middleware for route protection, and a `sharp` CVE reachable through a live,
+unrestricted `/next/image` pipeline. No repo in this sample of 20 contained a real hardcoded
+secret, a real SQL-injection sink, a real `eval`-on-attacker-input path, a real missing-auth
+route, or a real unverified Stripe webhook — so on this sample, nine of fifteen checks target
+bug classes that either don't occur often in AI-generated small-app code, or occur in a shape
+these particular checks don't yet catch.
+
+**README.md and SECURITY_SCOPE.md updated same day** to replace the "1-10 HIGH / 11-15
+MODERATE" framing with the real breakdown: `vulnerable-dependency` called out on its own as
+the one check validated by real evidence; the other five non-dependency "1-10" checks now
+explicitly flagged as "wrong 100% of the time they fired in the validation sample, treat as a
+lead not a verdict"; `sql-string-concatenation`/`cors-wildcard-with-credentials`/
+`supabase-rls-disabled` and checks 11-15 flagged as "no real-world data yet" rather than
+silently inheriting a confidence label from the bucket they happen to be numbered into.
+
+**Verdict — ship, with the doc fix, not blocked on more scanner work.** The scanning engine
+itself doesn't need a round 4: the checks that fired matched exactly the code shapes they
+were built to match, every time, in real code — this was a *precision* problem (the shape
+existing doesn't always mean the shape is dangerous), not a matching-accuracy problem, and
+narrowing that gap further (teaching the secret checks to recognize a Supabase anon-key JWT
+shape specifically, teaching `eval-on-input` to exclude `RegExp.prototype.exec`) is future
+work, not a blocker — those are known, well-understood, fixable false-positive *sources*, not
+open-ended fragility. What this validation actually demanded, and got, was a documentation
+fix: the tool was one honest paragraph away from telling users something the real data
+doesn't support. With that paragraph now rewritten in both `README.md` and
+`SECURITY_SCOPE.md`, and this entry as the permanent record of why, the tool is honest about
+exactly one thing being reliable (dependency findings) and everything else being a lead worth
+a human's five minutes, which is what it was always supposed to be. Ship it.

@@ -627,6 +627,57 @@ misattributing "(likely no network access)" warning were all fixed (see `depende
   merely adding those filenames to the recognized set would not help. The failure mode
   throughout is silent under-reporting, never a crash.
 
+## Real-world false-positive validation (2026-07-24) — supersedes the fixture-only confidence claims above
+
+Everything above this section was measured against fixtures this project's own team wrote —
+including the evasion samples the "adversarial" audits used. The round-3 strategic consultant
+pointed out that a closed loop like that says nothing about the metric that actually decides
+whether this tool is trustworthy: how often it's wrong on code someone else wrote. That
+measurement has now been run: 20 real, public AI-generated repos were sourced, cloned, scanned,
+and every finding was hand-triaged. Full methodology, per-checkId numbers, real false-positive
+patterns observed, and real true positives found are in
+[`docs/REAL_WORLD_VALIDATION.md`](./docs/REAL_WORLD_VALIDATION.md). Headline result, stated
+plainly because it changes what "trust this check" should mean going forward:
+
+- **253 findings triaged across 17 usable repos. 165 true positives, 84 false positives, 4
+  uncertain (65.2% / 33.2% / 1.6%).**
+- **All 165 true positives came from exactly one check: `vulnerable-dependency`.** It was
+  right 79.3% of the time on real code (165/208) and caught several current, serious,
+  actively-relevant CVEs in production dependencies.
+- **Every other check that fired at all — `secret-hardcoded-generic`, `secret-env-committed`,
+  `secret-git-history`, `eval-on-input`, `missing-auth-middleware`,
+  `stripe-webhook-unverified` — was wrong 100% of the time (45 findings, 45 false positives,
+  0 true positives).** The dominant real cause was not a bug in the regex pattern-matching
+  itself (each one matched exactly the structural shape it was built to match) but a mismatch
+  between "this shape exists" and "this shape is dangerous here": a Supabase anon/publishable
+  key is *designed* to be public and ship in client bundles, protected by Row Level Security
+  rather than secrecy, and it was the majority of the secret-check false positives; a
+  `RegExp.prototype.exec()` call shares the literal substring `exec` with
+  `child_process.exec`/`execSync` and repeatedly tripped `eval-on-input` despite doing nothing
+  dangerous.
+- **`sql-string-concatenation`, `cors-wildcard-with-credentials`, and
+  `supabase-rls-disabled` never fired once** across all 20 repos — no real-world evidence
+  either way yet. Same for all five checks added in v0.2.0 (11-15) — none of them fired on any
+  of the 20 repos, so the "prone to false positives on innocuous names" prediction made about
+  them going into this exercise remains a fixture-based judgment call, not a real-code-tested
+  one.
+- One genuine miss surfaced during triage, not itself a VibeScan finding: a Bolt.new-built
+  reservation app had an actual, real Supabase Row Level Security policy granting the public
+  `anon` role unrestricted `SELECT` on a table containing every guest's name, email, and phone
+  number — exactly what check 8 (`supabase-rls-disabled`) exists to catch, and check 8 never
+  flagged it. Recorded here as an honest false-negative data point: the check's current
+  pattern (config/table-definition text, `service_role` key in client code) does not cover an
+  overly-permissive RLS *policy* body written into a migration file, which was the actual
+  failure mode observed.
+
+**Practical effect on this document's earlier claims:** the "1-10 HIGH confidence / 11-15
+MODERATE confidence" framing that had accumulated through rounds 1-3 above (and was carried
+into `README.md`) is **not** what real-world code showed. The confidence split that actually
+held up runs *within* the 1-10 bucket, not around it — see `README.md`'s "Not all 15 checks
+carry the same confidence" section (rewritten alongside this entry) and
+`DECISIONS.md`'s "Real-world false-positive validation" entry for the full reasoning and the
+ship/no-ship call this data supports.
+
 ## Why this file exists
 
 This tool is aimed at people who did not write their own code and may not have the

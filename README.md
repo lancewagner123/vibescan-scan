@@ -15,19 +15,42 @@ report means "none of our 15 known patterns matched" — not "your app is secure
 
 ### Not all 15 checks carry the same confidence
 
-- **Checks 1–10** (leaked secrets, SQL injection, `eval`/RCE, CORS, missing auth,
-  Supabase RLS, unverified Stripe webhooks, vulnerable dependencies) are the most mature
-  and highest-confidence checks — they match on hard, structural signatures (an AWS key
-  *looks like* an AWS key), and have been through three rounds of adversarial hardening.
-  When one of these fires, it's almost certainly real.
+Fixture-based adversarial hardening (three rounds) is not the same evidence as real-world
+accuracy, so this section is grounded in both. A validation pass hand-triaged 253 findings
+across 17 real, public AI-generated repos (Lovable/Bolt/v0/Claude Code output found on
+GitHub) — see [`docs/REAL_WORLD_VALIDATION.md`](./docs/REAL_WORLD_VALIDATION.md) for the
+full methodology and numbers. The honest picture that came back does **not** split cleanly
+along the "checks 1–10 vs. checks 11–15" line the numbering might suggest:
+
+- **`vulnerable-dependency` (check 10) is genuinely high-confidence.** It matches installed
+  package versions against real CVE data, and it was right 79% of the time on real code
+  (165 of 208 real-world findings), including several current, serious CVEs in production
+  dependencies (a Next.js middleware auth-bypass advisory among them). Believe this one.
+- **The other checks in the "1–10" bucket — leaked secrets (3 checks), `eval`/RCE, missing
+  auth, and unverified Stripe webhooks — were wrong every single time they fired on real
+  code in that validation pass (45 findings, 45 false positives, 0 true positives).** The
+  dominant real-world pattern: Supabase's `anon`/publishable key (which Supabase's own
+  architecture is designed to ship in client bundles, protected by Row Level Security, not
+  secrecy) repeatedly triggered the secret checks; `eval-on-input` repeatedly matched
+  `RegExp.prototype.exec()` calls, which share the substring `exec` with
+  `child_process.exec` but do nothing of the sort. These checks still match real,
+  structural signatures — an AWS key *does* look like an AWS key — so they aren't being
+  removed, but "when one of these fires, it's almost certainly real" is not what real code
+  showed. Treat a finding from `secret-hardcoded-generic`, `secret-env-committed`,
+  `secret-git-history`, `eval-on-input`, `missing-auth-middleware`, or
+  `stripe-webhook-unverified` as a lead to verify, not a verdict.
+- **`sql-string-concatenation`, `cors-wildcard-with-credentials`, and
+  `supabase-rls-disabled`** never fired at all across the 20 repos in the validation sample
+  — there is no real-world evidence yet either way for these three.
 - **Checks 11–15** (insecure random tokens, weak password hashing, mass assignment,
-  insecure cookie flags, open redirect) are newer and lean more on naming/judgment
-  heuristics — "does this variable name look security-sensitive?" — which means some
-  false positives are **inherent to the approach, not bugs to be fixed**: a recipe app's
-  `secretIngredient` or a board game's `gameToken` will get flagged every time. Treat a
-  finding from checks 11–15 as "worth a quick look," not an automatic verdict. See
-  `SECURITY_SCOPE.md`'s per-check limitations for the specific known false-positive
-  patterns.
+  insecure cookie flags, open redirect) are newer, lean more on naming/judgment heuristics —
+  "does this variable name look security-sensitive?" — and are expected to false-positive on
+  innocuous names (a recipe app's `secretIngredient`, a board game's `gameToken`). That
+  expectation also has **no real-world data yet**: none of these five checks fired on any of
+  the 20 validation repos either. Treat a finding from checks 11–15 as "worth a quick look,"
+  not an automatic verdict, same as before — just know that's currently a fixture-based
+  judgment call, not yet a real-code-tested one. See `SECURITY_SCOPE.md`'s per-check
+  limitations for the specific known false-positive patterns.
 
 ### Framework coverage
 
