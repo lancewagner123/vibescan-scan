@@ -731,3 +731,54 @@ secondary signal specifically) and six positive-control fixtures confirming none
 fixes over-suppress a genuine secret, including a dedicated repro of the historical dot-secret
 regression case and a trailing-comma variant of it. Wired into `test/false-positives.test.js`.
 `npm test`: 109/109 passing (98 prior + 11 new).
+
+## Independent re-verification (2026-07-24, fourth pass — integration/QA sweep)
+
+Both fixes above (bugs A-D in one commit, bug E in a concurrent one) were re-verified from a
+clean checkout, independent of the fixing sessions' own claims:
+
+- **`npm test`: 109/109 passing**, no conflicts between the two commits (`9149490` dependency
+  fix + `c8db4c2` secrets fix landed cleanly on top of each other, touching disjoint files).
+- **CLI regression check:** `node bin/vibescan.js scan test/fixtures/vulnerable-demo-app`
+  still raises all 15 checkIds with no regression (raw findings span every one of
+  `secret-hardcoded-generic`, `secret-env-committed`, `secret-git-history`,
+  `sql-string-concatenation`, `cors-wildcard-with-credentials`, `eval-on-input`,
+  `missing-auth-middleware`, `supabase-rls-disabled`, `stripe-webhook-unverified`,
+  `vulnerable-dependency`, `weak-password-hashing`, `insecure-cookie-flags`,
+  `insecure-random-token`, `mass-assignment`, `open-redirect`).
+- **Bug D's historical dot-secret regression** was re-run by hand outside the fixture
+  harness (fresh `.env` containing the exact
+  `DB_ADMIN_SECRET=xK2mQ9pL4vR8tY1wZ3aB5cD7eF.gH0iJ...` value, in a real freshly-`git init`ed
+  repo, scanned via a direct `scanRepo()` call) — still fires as `secret-hardcoded-generic`
+  (and `secret-git-history`), confirming the fix's own stated self-test independently.
+- **Bug E's boundary fix** was re-run by hand against a real `npm install` (not mocked): a
+  fresh copy of the `24-vulnerable-dependency-boundary` fixtures, actually `npm install`ed,
+  then scanned via a direct `scanRepo()` call — `lodash@4.18.1` (patched-exact) produced 0
+  `vulnerable-dependency` findings, `lodash@4.17.21` (one release below) still fired. Also
+  attempted a from-scratch reproduction with the two packages actually named in the original
+  bug report (`brace-expansion@1.1.12`, `postcss@8.4.31`, both `npm install`ed fresh) — both
+  **still fire today**, confirming the fix's own investigation write-up above: the registry's
+  advisory data has moved on since the original report, these two pins are genuinely vulnerable
+  to newer, different CVEs now, so that specific pair is no longer a usable false-positive
+  repro. This is expected per the "Fix status (bug 5)" section above, not a fix failure — the
+  lodash fixture is the reproducible case going forward.
+
+- **A real, previously-undocumented gap found in Bug C's fix (not a regression — a scope
+  limit):** the fenced-code-block placeholder signal (`computeFencedLineNumbers` /
+  `isDocFilePath`) requires whole-file context to know whether a line sits inside a fence.
+  `secrets.js`'s own doc comment (search "no whole-file context is available" in
+  `scanTextForSecrets`'s JSDoc) already states this signal is intentionally not passed through
+  from `git-history.js`, which only ever sees one diff-added line at a time with no surrounding
+  file content to establish fence boundaries from. Hand-reconstructing the `doutor-tabajara`
+  README example (`GROQ_API_KEY=sua_chave_groq_aqui` inside a fenced code block, committed to a
+  fresh git repo) confirms the practical consequence: `secret-hardcoded-generic` on the current
+  file is correctly suppressed, but **`secret-git-history` still fires on the identical
+  content**, because its diff-line scan can't apply the fence-context signal at all. Since real
+  repos almost always have the offending line somewhere in their commit history (that's how the
+  original false positive was found in the first place, via a full-history scan of a real
+  clone), this means Bug C's fix closes the false positive for a HEAD-only scan but **not** for
+  a full-history scan of the same repo. This is an architectural limitation of the diff-line
+  scanning approach, not a quick one-line fix (passing `filePath` alone doesn't help — the
+  fence-boundary check needs multi-line file context that a single added diff line can't
+  supply) — recorded here as a known, real, currently-open gap rather than silently marking Bug
+  C "fully fixed" across both checkIds it can produce.

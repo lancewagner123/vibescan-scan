@@ -742,6 +742,20 @@ new, unrelated `vulnerable-dependency` bug. All five are now fixed:**
 
 `npm test`: 109/109 passing.
 
+**Independent re-verification (2026-07-24, fourth pass):** all five fixes above were re-run from
+a clean checkout by a separate integration/QA pass — full suite (109/109), a CLI run against
+`test/fixtures/vulnerable-demo-app` confirming all 15 checkIds still fire with no regression, and
+each of the 5 real-world false-positive shapes hand-reconstructed from scratch (fresh files, real
+`git init`/`npm install`, direct `scanRepo()` calls — not just re-running the committed fixtures)
+and confirmed behaving correctly, including bug D's highest-risk historical dot-secret regression
+case. One real, non-regression gap surfaced during this pass and is **not** fully closed: Bug C's
+fenced-code-block placeholder signal only applies to `secret-hardcoded-generic`'s working-tree
+scan; `secret-git-history`'s diff-line scan has no whole-file context to evaluate fence
+boundaries from, so the identical placeholder text still fires as `secret-git-history` once it's
+ever been committed (the normal case for a real repo). See
+`docs/REAL_WORLD_VALIDATION.md`'s "Independent re-verification (2026-07-24, fourth pass)" section
+for the full write-up.
+
 ## Why this file exists
 
 This tool is aimed at people who did not write their own code and may not have the
