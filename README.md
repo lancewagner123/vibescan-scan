@@ -28,17 +28,21 @@ along the "checks 1–10 vs. checks 11–15" line the numbering might suggest:
   dependencies (a Next.js middleware auth-bypass advisory among them). Believe this one.
 - **The other checks in the "1–10" bucket — leaked secrets (3 checks), `eval`/RCE, missing
   auth, and unverified Stripe webhooks — were wrong every single time they fired on real
-  code in that validation pass (45 findings, 45 false positives, 0 true positives).** The
-  dominant real-world pattern: Supabase's `anon`/publishable key (which Supabase's own
+  code in that original validation pass (45 findings, 45 false positives, 0 true positives).**
+  The two dominant root causes — Supabase's `anon`/publishable key (which Supabase's own
   architecture is designed to ship in client bundles, protected by Row Level Security, not
-  secrecy) repeatedly triggered the secret checks; `eval-on-input` repeatedly matched
-  `RegExp.prototype.exec()` calls, which share the substring `exec` with
-  `child_process.exec` but do nothing of the sort. These checks still match real,
-  structural signatures — an AWS key *does* look like an AWS key — so they aren't being
-  removed, but "when one of these fires, it's almost certainly real" is not what real code
-  showed. Treat a finding from `secret-hardcoded-generic`, `secret-env-committed`,
-  `secret-git-history`, `eval-on-input`, `missing-auth-middleware`, or
-  `stripe-webhook-unverified` as a lead to verify, not a verdict.
+  secrecy) repeatedly triggering the secret checks, and `eval-on-input` matching
+  `RegExp.prototype.exec()` calls that share the substring `exec` with `child_process.exec`
+  but do nothing of the sort — accounted for most of those 45 and **have since been fixed**
+  (see `docs/REAL_WORLD_VALIDATION.md`'s "Fix status" section and `SECURITY_SCOPE.md` for
+  commit references and regression coverage). `missing-auth-middleware` and
+  `stripe-webhook-unverified`'s real-world misses (both caused by not tracing into a
+  separate file where the real auth/verification logic actually lived) are **not yet fixed**
+  — that's a structural, cross-file limitation, not a quick regex tweak. Treat a finding
+  from `missing-auth-middleware` or `stripe-webhook-unverified` as a lead to verify, not a
+  verdict; the secret and `eval-on-input` checks are back to the same "structural signature,
+  probably real" confidence as the rest of this tier, now that their specific real-world
+  failure modes are closed.
 - **`sql-string-concatenation`, `cors-wildcard-with-credentials`, and
   `supabase-rls-disabled`** never fired at all across the 20 repos in the validation sample
   — there is no real-world evidence yet either way for these three.
