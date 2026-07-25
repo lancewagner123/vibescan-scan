@@ -516,6 +516,117 @@ under `test/fixtures/evasion-attempts/17-round2-new-evasions/`,
   the scanned path's own history — if the scope guard had tripped instead, there would be
   no such finding, only the warning.
 
+## Round 3 audit (2026-07-24, same day) — sophisticated-technique catalog on checks 1-9, fresh look at 11-15, dependency scope stress-test
+
+A third pass retrofitted the round-2 evasion catalog (TS type/return annotations,
+bracket/computed access, template-literal splitting, destructured imports, no-semicolon
+style, class static members) onto checks 1-9 (which had never seen it), took a fresh
+independent look at 11-15, and stress-tested check 10's dependency scope. **28 confirmed
+issues triaged: 21 fixed + regression-tested, 7 documented below as accepted limits.**
+Fixtures live under `test/fixtures/evasion-attempts/{19,20,21,22}-round3-*`, wired into
+`test/regression.test.js` and `test/false-positives.test.js`.
+
+**Fixed (false negatives now caught):**
+- Checks 1/3: a generic high-entropy secret written with a TS type annotation
+  (`const apiSecret: string = '...'`); a secret on a bracket-notation/concatenated computed
+  key (`config['apiSecret'] = '...'`); a known-format secret split with a `${...}`
+  template-literal placeholder. (Bracket-notation and template-literal splitting were both
+  already closed for checks 11/15 but never mirrored back onto checks 1/3.)
+- Check 4: `db['query'](...)` bracket method access; a SQL-builder helper with a TS
+  return-type annotation; a SQL string built into a TS-typed variable.
+- Check 5: `eval(await asyncArrowHelper(...))` — a leading `await` on an inlined async-arrow
+  helper.
+- Check 6: `credentials: x ?? true` / `|| true`; a wildcard origin held in a class static
+  field or a TS-typed variable.
+- Check 7: a genuinely-unauthenticated route whose handler body contains a vocab-word local
+  (`pageToken`) no longer spuriously suppressed — the auth-argument test now scans only
+  middleware argument positions, not the handler body (this also fixed the single-element
+  `[requireAuth]` middleware-array false positive).
+- Check 8: `process.env[[...].join('_')]` array-join and `process.env['A' + 'B']`
+  split-literal computed env-var keys (the exact evasions the check's own comment cited).
+- Check 9: `req['body']` bracket read and `const { body } = req` destructured read in the
+  no-`constructEvent` branch (the same dot/bracket/destructure taint-source coverage check
+  13 already had — the check-9 section above no longer overstates coverage for these two
+  shapes).
+- Check 11: a helper-call token assignment with no trailing semicolon.
+- Check 12: `md5`/`sha1` hashing via a destructured `const { createHash } = require('crypto')`
+  import.
+- Check 13: `req.body as Dto` cast and `req.body!` non-null assertion; `const data = {
+  ...req.body }; Model.create(data)` (spread into a variable, then passed).
+- Check 15: `res.redirect(req['query'].next)` bracket-notation redirect source (check 13 had
+  bracket support; check 15 didn't — asymmetry closed).
+- Systemic: `resolveConcatExpression`/`resolveIdentifierChain` (util.js) now tolerate a TS
+  variable type annotation before the `=`, closing the annotation gap for every check that
+  routes a value through a `const/let/var` hop.
+
+**Fixed (false positives):**
+- Checks 1/3: `.env.example` placeholder values that keep a descriptive suffix after the
+  keyword (`your-api-key-here`, `replace-with-your-own-secret-value`,
+  `set-your-database-password-here`) — the single most common example-env convention, now
+  recognized as placeholders.
+- Check 2: hyphen/compound env template filenames (`.env-example`, `.env.local.example`,
+  `.env.production.template`, `.env.dist.local`) — an asymmetry left over from round 2's
+  `ENV_FILE_RE` broadening; the safe-template exact-name Set is now a marker regex.
+- Check 14: ES6 shorthand cookie flags (`{ httpOnly, secure }` where `const secure = true`)
+  and a spread of a shared secure-defaults object (`{ ...COOKIE_DEFAULTS, maxAge }`) — both
+  are *more* careful patterns than an inline literal, so an FP on them was especially bad
+  for trust.
+
+**Check 10 (vulnerable-dependency):** the id-collision (same CVE in two workspace
+package.json files), raw-npm-stderr terminal leak, missing child-process timeout, and the
+misattributing "(likely no network access)" warning were all fixed (see `dependencies.js`).
+
+**Not fixed — new accepted limitations, documented rather than forced:**
+- **Secrets (checks 1/3) — base64 + split-literal combo.** A secret base64-encoded AND then
+  split across `+`-concatenated literals at a non-4-char-aligned boundary is not recovered:
+  the base64 pass decodes each fragment individually (each is invalid base64), and the
+  concat pass re-tests only the raw joined value, never base64-decoding it. This is two
+  independently-defended techniques deliberately stacked — a next-level adversarial evasion,
+  not a mainstream shape, and consistent with the existing "base64 only one level deep"
+  limitation above.
+- **Secrets (checks 1/3) — keyword-named LHS with a non-adjacent literal.** A generic secret
+  kept on the line but with no keyword-ish name *adjacent* to the literal
+  (`apiKey = getKey() ?? 'literal'`, `const { data: apiSecret } = { data: 'literal' }`,
+  `` sessionToken = `${''}literal` ``) is not flagged — the generic-entropy heuristic only
+  matches a keyword name immediately next to the literal. Genuinely closing this needs light
+  dataflow (associate a keyword-named LHS with a non-adjacent literal RHS), beyond a regex.
+- **Check 4 — class static-method / bare SQL builder.** A SQL builder written as a class
+  static method (`QueryBuilder.forUser(id)`) or called with no receiver after being
+  destructured off an object (`const { query } = pool; query(\`...${id}\`)`) is not traced.
+  Same one-hop-`function`-declaration limit already documented for check 4's arrow-function
+  builders; the bare-call form is additionally too false-positive-prone (any `query(`/
+  `execute(` with no receiver) to match safely.
+- **Check 5 — bracket/computed dangerous callee.** `cp['execSync'](...)`, `global['eval'](...)`
+  — computed access to eval/exec/Function is real obfuscation but uncommon in vibe-coded
+  apps, and the receiver/callee-name matching is dot-notation-shaped; left as a documented
+  gap rather than broadened.
+- **Check 11 — IIFE and getter token sources.** `Math.random()` inside a multi-line IIFE
+  assigned to a token-ish name (`const resetToken = (() => { ... })()`), and a getter that
+  mints a fresh `Math.random()` value per access (`get sessionToken() { return
+  Math.random()... }`), are not flagged — the callee-resolution requires a bare-identifier
+  callee (an IIFE's callee is a parenthesized arrow), and a getter is neither a `name = ...`
+  nor `name: ...` shape. Both are less common than the six check-11 shapes fixed this round.
+- **Check 10 — dev vs prod severity, and lockfile/package.json divergence.** A vulnerability
+  in a `devDependencies`-only (build/test-only) package is reported at full high/critical
+  severity indistinguishable from a production-runtime vuln (no `--omit=dev` split). And the
+  audit reflects the *resolved lockfile tree*, never comparing it to `package.json` — when
+  the two disagree (stale lockfile the dev already bumped in package.json, or vice versa) the
+  reported severity can mislead, with no "lockfile out of date" warning. Both are
+  recall-over-precision judgment calls, not crashes; documented rather than changed.
+- **Check 10 — pnpm/yarn lockfiles and workspace/internal-dep packages.** Only
+  `package-lock.json`/`npm-shrinkwrap.json` are recognized as committed lockfiles, so every
+  pnpm/yarn project is forced onto the network-dependent temp-install path even though it
+  has a perfectly good lockfile — and any nested package that references a sibling via
+  `workspace:*`, `*`, `file:`, or an unpublished version cannot be installed in isolation, so
+  its (possibly genuinely-vulnerable) dependencies are silently skipped (false negatives in
+  pnpm/Turborepo/Nx monorepos). Additionally, an npm-workspaces root audit already covers the
+  whole workspace, making the per-nested-package re-audit redundant. Closing these properly
+  needs a workspace-aware audit (detect `pnpm-workspace.yaml`/`workspaces`/`lerna.json` and
+  issue one audit at the root, and/or teach the tool to read pnpm/yarn lockfiles) — real
+  work, out of scope for this pass. `npm audit` itself cannot read a pnpm/yarn lockfile, so
+  merely adding those filenames to the recognized set would not help. The failure mode
+  throughout is silent under-reporting, never a crash.
+
 ## Why this file exists
 
 This tool is aimed at people who did not write their own code and may not have the
