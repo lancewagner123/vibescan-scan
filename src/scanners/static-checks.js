@@ -315,6 +315,30 @@ function isPlainDestructuredFromChildProcess(clean, callName) {
 // `import cp from 'child_process'`) — as opposed to merely being NAMED something
 // child_process-ish while actually holding a regex (`new RegExp(...)`, a regex literal) or
 // anything else. Traced back to a real declaration rather than trusted by name.
+// One-hop indirection (2026-07-24, adversarial round-4 fix): `varName` isn't always
+// assigned directly from a `require`/`import` -- it's also common to see it assigned from
+// a same-file HELPER that itself returns `require('child_process')`, e.g.
+//   function getChildProcessModule() { return require('child_process'); }
+//   const cp = getChildProcessModule();
+//   cp.exec(`run-task ${req.body.command}`, cb);
+// The adversarial check found this went silent under the receiver-traced rewrite even
+// though the coarser PRE-fix "does this file mention child_process anywhere" guard used to
+// catch it. Mirrors the one-hop function-call resolution already used elsewhere in this
+// file (argLooksInterpolated's inlined-helper case, the Math.random()-via-helper check) --
+// look up the callee's own return expression via lookupFunctionReturnExpr and test whether
+// THAT is a require('child_process') call. Deliberately not recursed a second level, same
+// convention as those other call sites.
+function isChildProcessModuleVarViaHelper(clean, varName) {
+  const escaped = varName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const callAssignRe = new RegExp(`(?:const|let|var)\\s+${escaped}\\s*=\\s*([A-Za-z_$][\\w$]*)\\s*\\([^)]*\\)`);
+  const callMatch = callAssignRe.exec(clean);
+  if (!callMatch) return false;
+  const returnExpr = lookupFunctionReturnExpr(clean, callMatch[1]);
+  if (!returnExpr) return false;
+  const inlineRequireRe = new RegExp(`^require\\(\\s*${CHILD_PROCESS_REQUIRE_STRING_RE}\\s*\\)$`);
+  return inlineRequireRe.test(returnExpr.trim());
+}
+
 function isChildProcessModuleVar(clean, varName) {
   const escaped = varName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const requireRe = new RegExp(`(?:const|let|var)\\s+${escaped}\\s*=\\s*require\\(\\s*${CHILD_PROCESS_REQUIRE_STRING_RE}\\s*\\)`);
@@ -322,7 +346,8 @@ function isChildProcessModuleVar(clean, varName) {
   const importStarRe = new RegExp(`import\\s*\\*\\s*as\\s+${escaped}\\s+from\\s*${CHILD_PROCESS_REQUIRE_STRING_RE}`);
   if (importStarRe.test(clean)) return true;
   const importDefaultRe = new RegExp(`import\\s+${escaped}\\s+from\\s*${CHILD_PROCESS_REQUIRE_STRING_RE}`);
-  return importDefaultRe.test(clean);
+  if (importDefaultRe.test(clean)) return true;
+  return isChildProcessModuleVarViaHelper(clean, varName);
 }
 
 // Ties the receiver classification and the two resolvers above together: true only when

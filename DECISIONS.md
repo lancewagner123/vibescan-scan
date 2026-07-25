@@ -734,3 +734,59 @@ namespace-import calls with interpolated input; `eval-and-function-tainted.js`: 
 Function()` on tainted input) confirm the fix didn't overcorrect into silence. Full suite:
 91/91 passing after this fix (adds 4 new tests: 2 false-positive fixtures + 2 positive
 controls).
+
+## Fixed 4 real-world bugs (Supabase anon key, literal-value requirement, exec() collision, RLS SQL migrations)
+
+An adversarial verification pass re-read the actual diffs for these four real-world-bug
+fixes (`git show 5fa05b5`, `git show 0904054`) and built fresh, non-fixture repros run
+through the real CLI (`node bin/vibescan.js scan .`), rather than trusting the integration
+report. Verdict: two of the four fixes were solid as shipped; two had real, reproducible
+regressions. Both regressions are now fixed, with new regression tests.
+
+**1. Supabase JWT role fix (`secrets.js`) — solid, no changes needed.** `service_role` JWTs
+still fire at `critical`; `anon`/`anonymous` roles are correctly suppressed; an unrecognized
+custom role or a malformed/non-JSON payload segment both fail safe (still fire). No
+overcorrection found.
+
+**2. "Literal value required" / `looksLikeCodeReference` fix (`secrets.js`) — real
+regression, now fixed.** `CODE_REFERENCE_VALUE_RE` matched *any* dot-separated,
+identifier-charset value — shape alone, with no requirement that it actually be a
+known-safe reference idiom. A real high-entropy secret assigned via the unquoted
+dotenv-style path that happened to contain literal dots and no other non-identifier
+characters (e.g. `DB_ADMIN_SECRET=xK2mQ9pL...gH0...bC1...`) was silently dropped with zero
+findings, while the intended target case (`SUPABASE_KEY=import.meta.env.VITE_SUPABASE_KEY`)
+still correctly suppressed. **Fix:** `looksLikeCodeReference` now also requires the value to
+start with a known-safe env-access root (`process.env.`, `import.meta.env.`, `Deno.env.`,
+`Bun.env.`) before the shape check even applies — scoped to what the exclusion was actually
+designed for. New positive-control fixture
+`test/fixtures/false-positives/23-real-world-secrets/_control-dotted-literal-secret-still-fires.env`
+asserts the dotted-literal case still fires.
+
+**3. `exec()` receiver-tracing fix (`static-checks.js`) — real regression, now fixed.** The
+positive control (bare destructured `exec()`/`execSync()`, and `child_process.exec()` via a
+direct `require`/import-traced variable) still fired correctly. But a receiver resolved
+through one hop of same-file indirection — `function getChildProcessModule() { return
+require('child_process'); } const cp = getChildProcessModule(); cp.exec(...)` — produced
+zero findings, because `isChildProcessModuleVar` only recognized a variable assigned
+*directly* from `require('child_process')`/an import. The old, coarser pre-fix "does this
+file mention `child_process` anywhere" guard used to catch this exact shape, so this was a
+real loss of coverage, not a wash. **Fix:** added `isChildProcessModuleVarViaHelper`, which
+mirrors the one-hop function-call resolution already used elsewhere in this file
+(`argLooksInterpolated`'s inlined-helper case, the `Math.random()`-via-helper check) — it
+looks up the callee's own return expression via the existing `lookupFunctionReturnExpr` and
+checks whether *that* is a `require('child_process')` call, deliberately not recursed a
+second level, same convention as the other call sites. New positive-control fixture
+`test/fixtures/false-positives/5-eval-on-input/indirect-cp-wrapper.js` asserts this shape
+still fires.
+
+**4. RLS `.sql` migration check (`static-checks.js`) — solid, no changes needed.** Fires
+correctly on an unsafe policy, stays silent on a properly-scoped policy and on an
+`INSERT ... WITH CHECK` with no `USING` clause. One honest, inherent false-positive class was
+noted (an intentionally-public `FOR SELECT TO anon USING (true)` catalog table fires the
+same as a genuinely unsafe policy, since the check has no way to know a table's data is
+meant to be public) — a documentation gap in `SECURITY_SCOPE.md`, not a code bug, and not
+fixed here since it's a known, accepted tradeoff class already documented for several other
+checks.
+
+Full suite: 93/93 passing after these fixes (adds 2 new regression tests: one positive
+control per fixed regression).

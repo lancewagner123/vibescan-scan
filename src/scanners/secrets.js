@@ -142,10 +142,25 @@ const ENTROPY_THRESHOLD = 3.0; // bits/char — placeholders/words fall well bel
 // (it's typically base64/hex/JWT-shaped with characters this pattern excludes), so
 // rejecting this shape is safe: it only ever suppresses a code reference, not a genuine
 // high-entropy literal.
+// Round-4 adversarial fix (2026-07-24): the original CODE_REFERENCE_VALUE_RE matched ANY
+// dot-separated, identifier-charset value -- shape alone, with no requirement that it
+// actually be a known-safe reference idiom. That's too broad: a real high-entropy secret
+// assigned via the UNQUOTED dotenv-style path (GENERIC_ENTROPY_UNQUOTED_RE) can legitimately
+// contain a literal `.` and nothing else outside `[A-Za-z0-9_$]`, e.g.
+//   DB_ADMIN_SECRET=xK2mQ9pL4vR8tY1wZ3aB5cD7eF.gH0iJ6kL2mN4oP8qR1sT3uV5wX7yZ9a.bC1dE3fG5hI7jK9lM1nO3pQ5rS7tU9vW
+// -- three base64-ish segments joined by dots, indistinguishable by shape alone from a real
+// property-access chain. That case was silently dropped with no fallback detection: a real
+// regression, not a hardening. Fixed by anchoring the suppression to the small set of
+// actual known-safe env-var-access ROOTS this exclusion was designed for (process.env.*,
+// import.meta.env.*, and the Deno/Bun equivalents) instead of accepting any dot-separated
+// identifier shape. A secret literal would have to deliberately start with one of these
+// exact prefixes to slip through -- vanishingly unlikely by construction, and not something
+// GENERIC_ENTROPY_UNQUOTED_RE's `{16,}`-char high-entropy values do in practice.
+const CODE_REFERENCE_ROOT_RE = /^(?:process\.env|import\.meta\.env|Deno\.env|Bun\.env)\./;
 const CODE_REFERENCE_VALUE_RE = /^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)+$/;
 
 function looksLikeCodeReference(value) {
-  return CODE_REFERENCE_VALUE_RE.test(value);
+  return CODE_REFERENCE_ROOT_RE.test(value) && CODE_REFERENCE_VALUE_RE.test(value);
 }
 
 function scanLineGenericEntropy(line) {

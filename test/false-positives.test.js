@@ -140,6 +140,18 @@ const POSITIVE_CONTROL_CASES = [
     'secret-hardcoded-generic',
     'an ordinary hardcoded high-entropy literal (not a JWT, not an env-var reference) must still be flagged',
   ],
+  // Round-4 adversarial fix (2026-07-24): CODE_REFERENCE_VALUE_RE used to match ANY
+  // dot-separated identifier-charset value, not just an actual known-safe env-access root
+  // -- so a real unquoted-dotenv-style secret containing literal dots (and no other
+  // non-identifier characters) was silently dropped. looksLikeCodeReference now also
+  // requires the value to start with a known-safe root (process.env./import.meta.env./
+  // Deno.env./Bun.env.) before the shape check even applies.
+  [
+    '23-real-world-secrets',
+    '_control-dotted-literal-secret-still-fires.env',
+    'secret-hardcoded-generic',
+    'an unquoted dotenv-shape high-entropy secret whose value happens to contain literal dots (not an env-var reference) must still be flagged',
+  ],
   // The eval-on-input receiver-tracing fix (above) must not overcorrect into silence: real
   // child_process.exec()/execSync() calls with interpolated input, and eval()/new Function()
   // on tainted input (which never go through the receiver-tracing logic at all), must all
@@ -155,6 +167,17 @@ const POSITIVE_CONTROL_CASES = [
     'eval-and-function-tainted.js',
     'eval-on-input',
     'eval()/new Function() on tainted request input must still be flagged',
+  ],
+  // Round-4 adversarial fix (2026-07-24): isChildProcessModuleVar only traced a receiver
+  // assigned DIRECTLY from require('child_process')/an import, not one obtained through one
+  // hop of same-file indirection (a wrapper function that itself returns
+  // require('child_process')) -- a real regression versus the coarser pre-fix "file mentions
+  // child_process" guard, which used to catch this shape.
+  [
+    '5-eval-on-input',
+    'indirect-cp-wrapper.js',
+    'eval-on-input',
+    'child_process.exec() reached via a same-file helper function (const cp = getChildProcessModule()) with interpolated request input must still be flagged',
   ],
 ];
 
