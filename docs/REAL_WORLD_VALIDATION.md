@@ -360,3 +360,261 @@ reproductions built from the descriptions above (not the checked-in regression f
 the real CLI/`scanRepo()` — a fresh anon-role JWT, a fresh env-var-reference assignment, a
 fresh filename-number-extractor sharing a file with an unrelated `child_process` import, and a
 fresh permissive-RLS-policy `.sql` migration, each producing the expected fire/no-fire result.
+
+---
+
+## Re-validation (post-fix) (2026-07-24, third pass)
+
+Fixture reconstructions and synthetic repros (above) prove the fixes work *in isolation*. This
+section is the harder test: **the same 20 repos from the original validation were re-cloned
+from scratch and re-scanned with the current, fixed VibeScan build, and every finding was
+hand-triaged again from zero** — not diffed against the old triage, not assumed. This is what
+"did the fix survive contact with the real code that motivated it" actually looks like measured,
+not asserted.
+
+### Methodology notes specific to this pass
+
+- Same 20 source repos, same cloning/triage discipline (read the flagged file, trace callers,
+  resolve real installed versions from the lockfile, delete the clone after triage) as the
+  original pass.
+- **4 of the 20 did not produce usable data this time** (clone/scan/triage task returned nothing)
+  — excluded from aggregates, same convention as the original pass's 2 exclusions. One repo
+  (`Food-Delivery`) cloned and scanned but its per-finding triage output was not captured in the
+  material available for this comparison — also excluded rather than guessed at. `1Flow` was
+  re-confirmed as the same README-only stub (0 findings, not a data point either way, same as
+  the original pass).
+- Net: **20 repos attempted → 15 produced a usable result (14 with real findings + `1Flow`'s
+  confirmed-empty result) → 14 repos contributed actual triaged finding data**, three fewer
+  contributing repos than the original pass's 17. This shrinks the sample and is a real
+  limitation of this comparison — treat the magnitude of any percentage shift with that in mind,
+  even though the direction of the two confirmed fixes (§below) is unambiguous because it's
+  demonstrated on named, specific repos, not just the aggregate blend.
+- One large repo (`blog-full-stack`) again produced far more raw findings (53, all
+  `vulnerable-dependency`) than could be triaged individually; 22 were sampled across both its
+  `client/` and `server/` manifests, covering every direct runtime dependency and a
+  representative spread of build-tooling transitives, and all 22 were TRUE_POSITIVE. Same
+  disclosure convention as the original pass: not blended in as if every one of the 53 got equal
+  scrutiny.
+
+### Aggregate numbers (this pass)
+
+| | count | % of total |
+|---|---|---|
+| Total findings triaged | 211 | 100% |
+| TRUE_POSITIVE | 169 | 80.1% |
+| FALSE_POSITIVE | 39 | 18.5% |
+| UNCERTAIN | 3 | 1.4% |
+
+### Per-checkId breakdown (this pass)
+
+| checkId | findings | TP | FP | Uncertain | real-world FP rate |
+|---|---|---|---|---|---|
+| `secret-hardcoded-generic` | 17 | 0 | 17 | 0 | **100%** |
+| `secret-env-committed` | 1 | 1 | 0 | 0 | 0% (n=1, weak signal) |
+| `secret-git-history` | 17 | 0 | 17 | 0 | **100%** |
+| `sql-string-concatenation` | 0 | — | — | — | no data (never fired) |
+| `cors-wildcard-with-credentials` | 0 | — | — | — | no data (never fired) |
+| `eval-on-input` | 1 | 1 | 0 | 0 | 0% (n=1, weak signal — see below) |
+| `missing-auth-middleware` | 0 | — | — | — | no data this pass (fired 0 times) |
+| `supabase-rls-disabled` | 5 | 5 | 0 | 0 | **0%** (new — see below) |
+| `stripe-webhook-unverified` | 1 | 0 | 1 | 0 | **100%** |
+| `vulnerable-dependency` | 169 | 162 | 4 | 3 | **2.4%** |
+| checks 11-15 | 0 | — | — | — | no data (never fired) |
+| **Total** | **211** | **169** | **39** | **3** | **18.5%** blended |
+
+### Direct before/after comparison
+
+**1. Did the secret checks' FP rate drop on the exact repos that produced the Supabase
+anon-key false positives before?**
+
+Yes, specifically and confirmably — but the checkId's *overall* real-world FP rate did not move,
+because a different false-positive shape filled the gap. Both things are true at once and the
+report would be dishonest citing only one.
+
+The original pass's three named anon-key examples ("Repo A — Lovable-built plant-diagnosis app,"
+"Repo B — Bolt-built Supabase reservation app," "Repo C — Lovable-built travel planner") map
+directly to three repos in this re-validation set: `plantdoc`, `brew--haven`, and
+`ai-odyssey-planner`. On all three, this pass explicitly confirmed the anon-key pattern is
+present in the code and confirmed it no longer fires:
+
+- **`plantdoc`** — "Confirmed present in code, confirmed NOT flagged (no regression)... this is
+  exactly the intended fix, verified against real code." 0 secret findings of any kind in this
+  repo's 14 triaged findings (all 14 are `vulnerable-dependency`).
+- **`brew--haven`** — "Did not fire, and correctly so. Read `supabaseClient.ts` — the anon key
+  is pulled from `import.meta.env.VITE_SUPABASE_ANON_KEY`, no hardcoded key present." 0 secret
+  findings across all 12 triaged findings.
+- **`ai-odyssey-planner`** — "did **not** fire. Confirmed `src/integrations/supabase/client.ts`
+  hardcodes a Supabase URL + a JWT-format `SUPABASE_PUBLISHABLE_KEY` (role `"anon"`) — exactly
+  the pattern that should be suppressed... Correctly absent from the raw findings list. **No
+  regression.**" The one secret finding this repo did produce (`secret-env-committed` on a
+  Sentry DSN) is an unrelated pattern and was judged TRUE_POSITIVE (git-tracked `.env`, correctly
+  flagged as a hygiene issue) — it is not a recurrence of the anon-key bug.
+
+**That is a clean, repo-for-repo confirmation that the targeted fix works exactly as designed.**
+
+But `secret-hardcoded-generic`/`secret-git-history` still landed at 100% FP (17/17) overall this
+pass, because four *different* false-positive shapes — none of them the anon-key pattern, none
+of them cataloged in the original pass's five other patterns — showed up on other repos:
+
+- **`react-gantt-lovable-starter`** (6 FP): auto-generated Supabase `types.ts` foreign-key
+  constraint names (`foreignKeyName: "tasks_project_id_fkey"`) misread as high-entropy secrets.
+- **`career-ops`** (3 FP): plain object-literal config values in a stage-name array
+  (`{ key: 'respondedToInterview', ... }`) misread the same way.
+- **`doutor-tabajara`** (1 FP): a README code-fence documentation placeholder
+  (`GROQ_API_KEY=sua_chave_groq_aqui`, Portuguese for "your_groq_key_here") misread as a leaked
+  key.
+- **`Vibelens`** (7 FP): `self.access_key`/`self.secret_key` object-attribute references passed
+  as constructor arguments — this is the closest miss of the four, because it's a variant of the
+  exact "env-var reference, not a literal value" pattern (§5 pattern 2 / fix #2) that was
+  supposedly fixed on 2026-07-24. The fix's `looksLikeCodeReference` guard requires the value to
+  start with a known-safe env-access root (`process.env.`, `import.meta.env.`, `Deno.env.`,
+  `Bun.env.`) — `self.access_key` is a dotted identifier reference of the same conceptual shape
+  (a variable, not a literal) but doesn't start with any of those four roots, so the guard
+  doesn't catch it. **This is a real, narrower-than-intended fix, not a new bug** — worth a
+  follow-up to broaden the "is this a reference, not a literal" check beyond the four
+  hardcoded env-access roots to any bare dotted-identifier chain with no string literal on the
+  line at all.
+
+Net for the secret checks: **the specific bug is fixed (3/3 confirmed on the repos that produced
+it); the checkId's real-world reliability is unchanged (100% → 100%)** because the underlying
+heuristic ("this string looks high-entropy/key-shaped") still has more false-positive shapes than
+just the one that got fixed. Report both halves; neither alone is honest.
+
+**2. Did `eval-on-input`'s FP rate drop on the repos that had `RegExp.exec()` false positives
+before?**
+
+Yes, and this one *did* move the checkId's real-world number: **100% FP (7/7) at baseline →
+0% FP (0/1) this pass**, with direct confirmation on a repo that had ample opportunity to
+misfire and didn't:
+
+- **`career-ops`** — "Confirmed real opportunity existed and was correctly suppressed. The
+  repo has ~15+ `RegExp.exec()` call sites across `agent-inbox.mjs`, `application-answers.mjs`,
+  `jd-skill-gap.mjs`, `merge-tracker.mjs`, `paste-reply.mjs`, `plugin-audit.mjs`, several
+  `providers/*.mjs` files, etc. — including calls on externally-derived input... None of these
+  fired as `eval-on-input` findings. This is a genuine confirmation the fix holds, not just an
+  absence-by-luck."
+
+Several other repos (`plantdoc`, `ai-odyssey-planner`, `CarePal`, `TrainerX`, `code-crux`,
+`bolt-expo-payload-main-video`) were grepped for `.exec(`/`RegExp` and had zero call sites at
+all, so they can't independently confirm the fix — only `career-ops` had genuine, exercised
+opportunity, but that one confirmation is exactly the shape of evidence the original bug report
+needed (a repo with real `.exec()` call sites on external input that used to misfire and now
+doesn't).
+
+The single `eval-on-input` finding that *did* fire this pass (`doutor-tabajara`,
+`app/api/analyze/route.ts:602`) is a genuine `child_process.execSync()` call — the pattern the
+check is supposed to catch, not a `RegExp.exec()` collision — correctly distinguished from the
+old failure mode, though the triager also noted its three interpolated arguments are all
+server-generated (not attacker-controlled), so it's pattern-accurate but low-exploitability in
+this specific instance. That nuance doesn't change the headline: **the specific `RegExp.exec()`
+collision that produced 7/7 false positives at baseline produced zero on re-scan.**
+
+**3. Did `supabase-rls-disabled` fire on a `.sql` migration this time — specifically, does it
+now catch the real vulnerability a human found by hand in the Bolt reservation app?**
+
+**Yes — confirmed, on the exact repo.** `brew--haven` is the same "Bolt.new-built reservation
+app" the original validation's §6 records a human manually finding a real, unfixed
+`USING (true)` anonymous-SELECT policy on a guest-PII table that the *old* check 8 never
+flagged (recorded there as an honest false-negative, not counted in that pass's FP math because
+it wasn't a VibeScan finding to triage at all).
+
+This pass, the new `.sql`-migration scan pass fired directly on it:
+
+> "`supabase-rls-disabled` | critical | `20260627011241_create_reservations_table.sql:69` |
+> **TRUE_POSITIVE** | ...RLS is enabled..., but the `anon_select_reservations` policy grants
+> `SELECT` to `anon, authenticated` with `USING (true)` — no per-row filter at all... any
+> unauthenticated client can `SELECT *` from `reservations` and harvest every guest's name,
+> email, and phone number... **Confirms the new `supabase-rls-disabled` SQL-migration detection
+> is working correctly here** — first repo in this pass where it actually fired, and it fired
+> on a legitimate issue, not a false alarm."
+
+The new detection capability also fired correctly on a second, independent repo
+(`react-gantt-lovable-starter`, 4/4 TRUE_POSITIVE — unrestricted `anon`-writable policies on a
+`tasks`/`links`/`project_members` schema, self-labeled "demo mode" in code comments but a real
+any-anonymous-user-can-mutate-or-wipe-all-project-data exposure if pointed at real data).
+**5 for 5 across two repos, 0% FP rate, and the one specific miss this whole validation exercise
+was built to surface is now caught.**
+
+**4. Are there new false positives this pass that weren't false-positive patterns in the
+original baseline — evidence the fixes introduced a real-world regression the constructed
+adversarial tests didn't catch?**
+
+Two findings worth flagging honestly, neither of which the automated regression suite (93/93
+passing) would have caught, because neither is the shape any existing fixture targets:
+
+- **The `self.access_key` near-miss on `Vibelens`** (detailed in §1 above) — not a regression in
+  the sense of "something that used to work now fails," since this exact shape was never tested
+  before, but it is a **sibling of an already-"fixed" pattern that the fix didn't generalize to
+  cover.** Worth tracking as a follow-up, not re-opening the original fix as broken.
+- **A dependency-version boundary bug on `Vibelens`**: `brace-expansion` and `postcss` were both
+  flagged `vulnerable-dependency`, but the triager found the actual installed versions
+  (`1.1.12`/`2.0.2` for brace-expansion, `8.4.31` for postcss) are the *patched* releases
+  themselves, not versions preceding the patch — a `<=` range comparison that's inclusive where
+  it should be exclusive (or is being compared against the wrong boundary). This is a new,
+  previously-unobserved failure mode for `vulnerable-dependency` (not one of the four checkIds
+  this validation round targeted), first surfaced here because this specific repo happened to be
+  pinned exactly on the fix commit for two different packages simultaneously — bad luck making a
+  real bug visible, not a fluke result. Contributed all 4 of this pass's `vulnerable-dependency`
+  false positives and 2 of its 3 uncertain verdicts (`flatted`, `glob`, where no advisory could
+  be located for the installed version in the time available). **This warrants its own follow-up
+  fix and regression fixture** — it sits outside the four bugs this validation round measured,
+  but it's real, reproducible, and now documented.
+- The three other secret-check false-positive shapes cataloged in §1 above (auto-generated FK
+  names, plain config-array strings, README placeholder text) are new *examples* but not a new
+  *mechanism* — they're the same "high-entropy/key-shaped string, no literal-secret content"
+  root cause the original validation's pattern 1 and pattern 3 already named, just different
+  surface text. Not counted as a new regression class, but confirmed the underlying heuristic
+  is still broad enough to catch non-secret content routinely.
+
+**No confirmed false positives appeared this pass on any of the four specifically-targeted
+patterns themselves** (Supabase anon key, bare env-var reference in its originally-scoped form,
+`RegExp.exec()`, RLS-disabled `.sql` detection) — the two new items above are adjacent-but-
+distinct gaps, not the same bugs resurfacing.
+
+### Updated overall/per-check accuracy — better, worse, or unchanged, with real numbers
+
+| | baseline (original pass, n=253) | re-validation (this pass, n=211) | change |
+|---|---|---|---|
+| TRUE_POSITIVE | 165 (65.2%) | 169 (80.1%) | **+14.9 points** |
+| FALSE_POSITIVE | 84 (33.2%) | 39 (18.5%) | **-14.7 points** |
+| UNCERTAIN | 4 (1.6%) | 3 (1.4%) | -0.2 points |
+
+**Better, with real numbers, not vibes — but attribute the improvement correctly, because most
+of it is not the four targeted fixes:**
+
+- The blended accuracy improvement is driven overwhelmingly by `vulnerable-dependency`'s share
+  of the total (169/211 = 80% of all findings this pass, up from 208/253 = 82% at baseline —
+  roughly the same share, but its own FP rate fell from 18.8% (39/208) to 2.4% (4/169)).
+  `vulnerable-dependency` was **not** one of the four targeted fixes — its improvement this pass
+  is best explained by which specific repos/dependency-versions happened to be sampled and
+  triaged this time (in particular, one repo, `Vibelens`, supplied all 4 of this pass's
+  dependency false positives via the boundary bug in item 4 above — remove that one repo's
+  contribution and the dependency FP rate would round to roughly 0%). **Do not read the
+  18.8%→2.4% shift as "the dependency checker got 8x more accurate"; read it as "this specific
+  20-repo sample happened to land differently, and it surfaced one new real bug in the
+  process."**
+- Per-check, the two checks the fixes specifically targeted moved exactly as predicted and for
+  the reasons demonstrated in items 1-2 above: **`eval-on-input` 100%→0% FP (confirmed exercised,
+  not just absent)**, and the secret checks' *specific targeted pattern* confirmed fixed on 3/3
+  cited repos even though the checkId's blended number didn't move.
+- `supabase-rls-disabled` went from "no real-world data, never fired" to **5/5 TRUE_POSITIVE
+  (0% FP)**, including the one specific real vulnerability this entire validation exercise was
+  built around. That's the strongest single result in this comparison.
+- `stripe-webhook-unverified` and `missing-auth-middleware` were **not** among the four targeted
+  fixes and the data reflects that: `stripe-webhook-unverified` recurred at 100% FP (1/1,
+  `vibecoded_marathon_photos`, same "didn't trace into the caller's try/catch" root cause as
+  baseline); `missing-auth-middleware` simply didn't fire this pass (0 findings — no repo in
+  this smaller 14-repo contributing set happened to exercise it), which is silence, not evidence
+  of improvement.
+
+**Bottom line for this section:** two of the four targeted fixes (`eval-on-input`'s
+`RegExp.exec()` collision, and `supabase-rls-disabled`'s missing `.sql` coverage) are
+demonstrated, measurable improvements on real code, backed by specific named repos and quoted
+triage reasoning, not just a cleaner aggregate number. The Supabase-anon-key fix is also
+demonstrated and confirmed on the exact repos that motivated it, but it didn't move its
+checkId's aggregate FP rate because a sibling false-positive class filled the gap immediately —
+report the fix as working and the checkId as still unreliable, both at once, because both are
+true. One new, real, previously-undocumented bug (`vulnerable-dependency`'s inclusive-boundary
+comparison) and one narrower-than-intended fix (`self.X`-shaped variable references not covered
+by the "env-var reference" guard) surfaced as a direct result of doing this measurement
+honestly — recorded here rather than smoothed over, consistent with why this exercise exists.

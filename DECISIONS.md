@@ -790,3 +790,56 @@ checks.
 
 Full suite: 93/93 passing after these fixes (adds 2 new regression tests: one positive
 control per fixed regression).
+
+## Re-validation: measuring the effect of the 4 bug fixes (2026-07-24)
+
+Fixture regression tests prove a fix works in isolation; they don't prove it survives contact
+with the real code that motivated it. So the same 20 real repos from the original real-world
+validation (`docs/REAL_WORLD_VALIDATION.md`) were **re-cloned from scratch and re-triaged from
+zero** against the current, fixed VibeScan build — not diffed against the old triage, a fresh
+hand-triage of every finding. Full comparison, per-repo quotes, and the two new issues this
+surfaced: `docs/REAL_WORLD_VALIDATION.md`'s "Re-validation (post-fix)" section.
+
+**Headline numbers:** 4 of 20 repos didn't produce usable data this pass (down from 17
+contributing repos to 14) — a real limitation of this comparison, disclosed rather than
+papered over. Of the 14 that did: **211 findings triaged, 169 TRUE_POSITIVE (80.1%), 39
+FALSE_POSITIVE (18.5%), 3 UNCERTAIN (1.4%)** — versus the original pass's 253/165(65.2%)/
+84(33.2%)/4(1.6%). Better in the aggregate, but the improvement is **not evenly earned by the
+four fixes** — attribute it correctly:
+
+- **`eval-on-input`: confirmed fixed, checkId-level.** 100% FP (7/7) at baseline → 0% FP (0/1)
+  this pass, with direct confirmation on a repo (`career-ops`) that has 15+ real `RegExp.exec()`
+  call sites on external input that used to misfire and now don't — not just an absence of the
+  pattern.
+- **`supabase-rls-disabled`: confirmed fixed, and it's the best result in the whole exercise.**
+  0 real-world findings ever → 5/5 TRUE_POSITIVE (0% FP) this pass, including catching, on
+  `brew--haven`, the *exact* real vulnerability (anonymous-readable Supabase policy exposing
+  every guest's name/email/phone in a Bolt.new reservation app) a human had to find manually
+  in the original pass because the old check had zero `.sql`-migration coverage. The specific
+  gap this whole validation exercise exists to close is now closed, on the same repo, verified.
+- **Supabase anon-key fix: confirmed fixed on the exact 3 repos that produced the bug
+  (`plantdoc`, `brew--haven`, `ai-odyssey-planner`) — but the checkId's overall FP rate didn't
+  move (100%→100%, 17/17).** Different false-positive shapes (auto-generated FK constraint
+  names, config-array strings, README placeholders, and a `self.access_key`-style near-miss of
+  the "env-var reference" fix that doesn't start with one of the four hardcoded safe-root
+  prefixes) filled the gap immediately. Report both halves honestly: the targeted bug is dead,
+  the checkId is still unreliable in practice.
+- **`vulnerable-dependency`'s FP rate also fell (18.8%→2.4%) despite not being one of the four
+  targeted fixes** — mostly sample variation, plus one new, real, previously-undocumented bug
+  this pass surfaced: a `<=`-range comparison that's inclusive of the *patched* version itself
+  (caught two packages, `brace-expansion` and `postcss`, both pinned exactly on their own fix
+  commit, on one repo — `Vibelens`). That one repo supplied all 4 of this pass's dependency
+  false positives. Worth its own follow-up fix; out of scope for this measurement round but too
+  real to leave undocumented.
+- **`missing-auth-middleware`/`stripe-webhook-unverified` were not part of this fix round and
+  the data reflects that** — `stripe-webhook-unverified` recurred at 100% FP with the identical
+  root cause (evaluating a helper without tracing its caller's try/catch); `missing-auth-
+  middleware` simply didn't fire in this smaller contributing sample, which is silence, not
+  improvement.
+
+**No confirmed regressions on the four targeted patterns themselves.** The two new issues found
+(the `self.X`-shaped secret near-miss, the dependency-boundary bug) are adjacent gaps the fixes
+never claimed to cover, not the original bugs resurfacing — recorded as follow-up work, not
+reopened fixes. `npm test`: 93/93 passing throughout. `README.md` and
+`docs/REAL_WORLD_VALIDATION.md` updated with the real before/after numbers in place of the
+stale pre-fix figures.
