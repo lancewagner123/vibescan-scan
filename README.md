@@ -13,6 +13,32 @@ tells you.** In short: this is static analysis only (no dynamic testing/fuzzing)
 not find business-logic bugs, it makes no compliance/regulatory claims, and a clean
 report means "none of our 15 known patterns matched" — not "your app is secure."
 
+### Not all 15 checks carry the same confidence
+
+- **Checks 1–10** (leaked secrets, SQL injection, `eval`/RCE, CORS, missing auth,
+  Supabase RLS, unverified Stripe webhooks, vulnerable dependencies) are the most mature
+  and highest-confidence checks — they match on hard, structural signatures (an AWS key
+  *looks like* an AWS key), and have been through three rounds of adversarial hardening.
+  When one of these fires, it's almost certainly real.
+- **Checks 11–15** (insecure random tokens, weak password hashing, mass assignment,
+  insecure cookie flags, open redirect) are newer and lean more on naming/judgment
+  heuristics — "does this variable name look security-sensitive?" — which means some
+  false positives are **inherent to the approach, not bugs to be fixed**: a recipe app's
+  `secretIngredient` or a board game's `gameToken` will get flagged every time. Treat a
+  finding from checks 11–15 as "worth a quick look," not an automatic verdict. See
+  `SECURITY_SCOPE.md`'s per-check limitations for the specific known false-positive
+  patterns.
+
+### Framework coverage
+
+Checks 7, 9, 13, 14, and 15 are shaped around **Express**-style route/middleware code;
+checks 11–12 are plain JS/TS pattern matches with no framework assumption. On a
+Next.js/Fastify/NestJS API, or a non-JS backend (Django, Flask, Rails, etc.), those
+Express-shaped checks will typically find nothing to report — not because the code is
+safe, but because the pattern they look for doesn't exist in that framework's idioms.
+VibeScan does not yet detect its target's framework or warn when a check's shape doesn't
+apply — assume Express-oriented checks are silent, not confirmed-clean, on other stacks.
+
 ## Usage
 
     npx vibescan-scan scan [path]
