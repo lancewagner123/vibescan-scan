@@ -70,6 +70,49 @@ const MULTILINE_PATTERNS = [
   },
 ];
 
+// --- Supabase anon/publishable-key JWT recognition (real-world FP fix, 2026-07-24) -----
+//
+// The real-world false-positive validation exercise (docs/REAL_WORLD_VALIDATION.md, §5.1)
+// found this was the single largest source of false positives (~14 of 45): across
+// multiple independently-sourced Lovable/Bolt/Supabase-stack repos,
+// secret-hardcoded-generic/secret-git-history flagged the Supabase client's
+// publishable/anon key -- either because it's JWT-shaped (matches SINGLE_LINE_PATTERNS'
+// jwt-shaped-token) or because its variable name contains "key"
+// (SUPABASE_PUBLISHABLE_KEY / SUPABASE_ANON_KEY, matching the generic name-based
+// heuristic below). Supabase's own documented architecture *designs* this key to ship in
+// client bundles -- access control is enforced server-side by Row Level Security policies,
+// not by keeping the string secret -- so flagging it as a leaked credential is simply
+// wrong, not just noisy.
+//
+// The fix: when a candidate secret value is JWT-shaped, decode the middle (payload)
+// segment and check its `role` claim. `"role":"anon"`/`"anonymous"` is the public,
+// by-design key -- suppress it. `"role":"service_role"` (or any other/missing role) is
+// NOT suppressed -- a service_role key genuinely bypasses RLS and is a real leaked
+// credential, so it must keep firing at full severity. Decode failures (malformed
+// base64, non-JSON payload, no `role` claim) also fall through to normal flagging --
+// this only ever *suppresses* a finding on a confirmed-safe decode, never on a guess.
+const JWT_SHAPE_RE = /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/;
+
+function decodeJwtPayloadRole(value) {
+  if (typeof value !== 'string' || !JWT_SHAPE_RE.test(value)) return null;
+  const payloadSegment = value.split('.')[1];
+  try {
+    const normalized = payloadSegment.replace(/-/g, '+').replace(/_/g, '/');
+    const padded = normalized + '='.repeat((4 - (normalized.length % 4)) % 4);
+    const decoded = Buffer.from(padded, 'base64').toString('utf8');
+    const payload = JSON.parse(decoded);
+    if (payload && typeof payload.role === 'string') return payload.role;
+    return null;
+  } catch {
+    return null; // malformed base64/JSON -- can't confirm anything, fall through to flagging
+  }
+}
+
+function isSupabaseAnonRoleJwt(value) {
+  const role = decodeJwtPayloadRole(value);
+  return role === 'anon' || role === 'anonymous';
+}
+
 // --- Generic high-entropy key/secret/token/password literal heuristic ----------------
 
 // Matches `<name containing key/secret/token/password>: "<long literal>"` style
@@ -86,6 +129,25 @@ const MULTILINE_PATTERNS = [
 const GENERIC_ENTROPY_RE = /[\w.$]*(?:key|secret|token|password|passwd|pwd)[\w]*\s*(?:[:=]|:\s*[A-Za-z_$][\w$.<>[\]| ]*=)\s*["'`]([A-Za-z0-9+/_=-]{20,})["'`]/gi;
 const ENTROPY_THRESHOLD = 3.0; // bits/char — placeholders/words fall well below this
 
+// Real-world FP fix (2026-07-24, docs/REAL_WORLD_VALIDATION.md §5.2): several
+// secret-hardcoded-generic hits on real code were lines like
+// `const KEY = import.meta.env.VITE_SUPABASE_KEY` or `PINECONE_KEY = process.env.PINECONE_KEY`
+// -- the heuristic matched a variable/property *name* containing "key"/"secret"/"token",
+// but the RHS is a reference to an environment variable (a plain dotted identifier/
+// property-access chain, e.g. `process.env.X`, `import.meta.env.X`, `config.apiKey`), not
+// an actual literal value. Referencing an env var by name is the SAFE pattern (the real
+// secret lives in the environment, never in source) -- there is nothing hardcoded on that
+// line at all, so it must not fire. A real hardcoded secret/token virtually never
+// round-trips as a bare, all-word-characters, dot-separated identifier chain like this
+// (it's typically base64/hex/JWT-shaped with characters this pattern excludes), so
+// rejecting this shape is safe: it only ever suppresses a code reference, not a genuine
+// high-entropy literal.
+const CODE_REFERENCE_VALUE_RE = /^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)+$/;
+
+function looksLikeCodeReference(value) {
+  return CODE_REFERENCE_VALUE_RE.test(value);
+}
+
 function scanLineGenericEntropy(line) {
   const hits = [];
   GENERIC_ENTROPY_RE.lastIndex = 0;
@@ -93,7 +155,9 @@ function scanLineGenericEntropy(line) {
   while ((m = GENERIC_ENTROPY_RE.exec(line)) !== null) {
     const value = m[1];
     if (looksLikePlaceholder(value)) continue;
+    if (looksLikeCodeReference(value)) continue;
     if (shannonEntropy(value) < ENTROPY_THRESHOLD) continue;
+    if (isSupabaseAnonRoleJwt(value)) continue;
     hits.push({ value, matchedText: m[0] });
   }
   return hits;
@@ -117,7 +181,9 @@ function scanLineGenericEntropyUnquoted(line) {
   while ((m = GENERIC_ENTROPY_UNQUOTED_RE.exec(line)) !== null) {
     const value = m[1];
     if (looksLikePlaceholder(value)) continue;
+    if (looksLikeCodeReference(value)) continue;
     if (shannonEntropy(value) < ENTROPY_THRESHOLD) continue;
+    if (isSupabaseAnonRoleJwt(value)) continue;
     hits.push({ value, matchedText: m[0] });
   }
   return hits;
@@ -151,7 +217,9 @@ function scanLineGenericEntropyBracket(line) {
     if (!KEYWORDISH_NAME_RE.test(joined)) continue;
     const value = m[2];
     if (looksLikePlaceholder(value)) continue;
+    if (looksLikeCodeReference(value)) continue;
     if (shannonEntropy(value) < ENTROPY_THRESHOLD) continue;
+    if (isSupabaseAnonRoleJwt(value)) continue;
     hits.push({ value, matchedText: m[0] });
   }
   return hits;
@@ -279,6 +347,7 @@ function scanTextForSecrets(text) {
     for (const pattern of SINGLE_LINE_PATTERNS) {
       const m = line.match(pattern.regex);
       if (m) {
+        if (isSupabaseAnonRoleJwt(m[0])) continue; // Supabase anon/publishable key -- safe by design, see decodeJwtPayloadRole above
         hits.push({
           name: pattern.name,
           line: i + 1,
@@ -316,6 +385,7 @@ function scanTextForSecrets(text) {
       });
     }
     for (const hit of scanLineTemplateLiteralSplit(line)) {
+      if (isSupabaseAnonRoleJwt(hit.secretValue)) continue;
       hits.push({
         name: hit.name,
         line: i + 1,
@@ -325,6 +395,7 @@ function scanTextForSecrets(text) {
       });
     }
     for (const hit of scanLineConcatChains(line)) {
+      if (isSupabaseAnonRoleJwt(hit.secretValue)) continue;
       hits.push({
         name: hit.name,
         line: i + 1,
@@ -334,6 +405,7 @@ function scanTextForSecrets(text) {
       });
     }
     for (const hit of scanLineBase64Encoded(line)) {
+      if (isSupabaseAnonRoleJwt(hit.secretValue)) continue;
       hits.push({
         name: hit.name,
         line: i + 1,
@@ -868,6 +940,9 @@ module.exports = {
   scanTextForSecrets,
   SINGLE_LINE_PATTERNS,
   MULTILINE_PATTERNS,
+  decodeJwtPayloadRole,
+  isSupabaseAnonRoleJwt,
+  looksLikeCodeReference,
   CHECK_HARDCODED,
   CHECK_ENV_COMMITTED,
   CHECK_INSECURE_RANDOM_TOKEN,

@@ -62,6 +62,25 @@ const FIXED_FALSE_POSITIVE_CASES = [
     'open-redirect',
     'redirect target validated via an allowlist array named "internalPaths" (not allowlist/whitelist-prefixed)',
   ],
+  // --- Real-world false-positive validation fixes (2026-07-24, docs/REAL_WORLD_VALIDATION.md) ---
+  [
+    '23-real-world-secrets',
+    'supabase-anon-key-client.js',
+    'secret-hardcoded-generic',
+    'Supabase publishable/anon key (JWT decodes to "role":"anon") -- safe by design, RLS enforces access server-side',
+  ],
+  [
+    '23-real-world-secrets',
+    'supabase-anon-key.env',
+    'secret-hardcoded-generic',
+    'Supabase anon key in unquoted dotenv-shape KEY=value form -- same "role":"anon" JWT as above',
+  ],
+  [
+    '23-real-world-secrets',
+    'env-var-reference.js',
+    'secret-hardcoded-generic',
+    'variable/property name contains "key"/"secret"/"token" but the RHS is an env-var reference (import.meta.env.X / process.env.X), not a literal value',
+  ],
 ];
 
 for (const [subfolder, filename, checkId, description] of FIXED_FALSE_POSITIVE_CASES) {
@@ -73,6 +92,40 @@ for (const [subfolder, filename, checkId, description] of FIXED_FALSE_POSITIVE_C
       0,
       `expected zero ${checkId} findings on ${subfolder}/${filename} (${description}) -- a false-positive fix may have regressed. ` +
         `Found: ${JSON.stringify(hits.map((h) => ({ file: h.file, line: h.line, snippet: h.snippet })))}`
+    );
+  });
+}
+
+// --- Positive controls: overcorrection guards for the real-world secrets fixes --------
+// The two false-positive fixes above (Supabase anon-key JWT recognition, env-var-reference
+// rejection) must not swallow genuinely dangerous findings. These assert the opposite of
+// the cases above: secret-hardcoded-generic MUST still fire on (1) a real Supabase
+// service_role key (bypasses RLS -- a real leaked credential, distinguished from the safe
+// anon key purely by its JWT "role" claim) and (2) an ordinary hardcoded literal secret
+// with no JWT/env-var-reference shape at all.
+const POSITIVE_CONTROL_CASES = [
+  [
+    '23-real-world-secrets',
+    '_control-service-role-key-still-fires.js',
+    'secret-hardcoded-generic',
+    'a service_role JWT (role !== anon) must still be flagged at full severity',
+  ],
+  [
+    '23-real-world-secrets',
+    '_control-literal-secret-still-fires.js',
+    'secret-hardcoded-generic',
+    'an ordinary hardcoded high-entropy literal (not a JWT, not an env-var reference) must still be flagged',
+  ],
+];
+
+for (const [subfolder, filename, checkId, description] of POSITIVE_CONTROL_CASES) {
+  test(`false-positives/${subfolder}/${filename}: ${checkId} STILL fires (${description})`, async () => {
+    const findings = await scanSubfolder(subfolder);
+    const hits = findings.filter((f) => f.checkId === checkId && f.file.includes(filename));
+    assert.ok(
+      hits.length > 0,
+      `expected at least one ${checkId} finding on ${subfolder}/${filename} (${description}) -- ` +
+        'a false-positive fix may have overcorrected and suppressed a real secret.'
     );
   });
 }
